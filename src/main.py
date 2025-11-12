@@ -362,6 +362,125 @@ def get_request_headers():
         "Cookie": f"cf_clearance={cf_clearance}; arena-auth-prod-v1={auth_token}",
     }
 
+def estimate_tokens(text: str) -> int:
+    """
+    Estimate token count from text using character-based approximation.
+    Roughly 1 token ≈ 4 characters for English text.
+    """
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+def get_model_context_limit(model_name: str) -> int:
+    """
+    Get the context window limit for a model based on its name.
+    Returns estimated context window size in tokens.
+    """
+    model_lower = model_name.lower()
+    
+    # GPT models
+    if "gpt-4" in model_lower or "gpt-4o" in model_lower:
+        if "128k" in model_lower:
+            return 128000
+        return 128000  # GPT-4 and GPT-4o default
+    elif "gpt-3.5" in model_lower:
+        if "16k" in model_lower:
+            return 16384
+        return 4096
+    
+    # Claude models
+    elif "claude" in model_lower:
+        if "opus" in model_lower or "sonnet" in model_lower:
+            if "200k" in model_lower:
+                return 200000
+            return 200000  # Claude 3/3.5 Opus and Sonnet
+        elif "haiku" in model_lower:
+            return 200000  # Claude 3/3.5 Haiku
+        return 100000  # Other Claude models
+    
+    # Gemini models
+    elif "gemini" in model_lower:
+        if "2.5" in model_lower or "2.0" in model_lower:
+            return 1000000  # Gemini 2.0/2.5
+        elif "1.5" in model_lower:
+            if "pro" in model_lower:
+                return 2000000  # Gemini 1.5 Pro
+            return 1000000  # Gemini 1.5 Flash
+        return 128000  # Gemini 1.0
+    
+    # Llama models
+    elif "llama" in model_lower:
+        if "3.3" in model_lower or "3.1" in model_lower:
+            return 128000  # Llama 3.1/3.3
+        elif "3" in model_lower:
+            return 8192  # Llama 3
+        return 4096  # Llama 2
+    
+    # Mistral models
+    elif "mistral" in model_lower:
+        if "large" in model_lower:
+            return 128000  # Mistral Large
+        return 32768  # Other Mistral models
+    
+    # Qwen models
+    elif "qwen" in model_lower:
+        if "2.5" in model_lower:
+            return 128000
+        return 32768
+    
+    # DeepSeek models
+    elif "deepseek" in model_lower:
+        if "v3" in model_lower:
+            return 64000
+        return 32768
+    
+    # Default fallback
+    return 32768
+
+def calculate_conversation_tokens(messages: List[dict]) -> int:
+    """
+    Calculate total token count for a conversation's message history.
+    """
+    total_tokens = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_tokens += estimate_tokens(content)
+        elif isinstance(content, list):
+            # Handle array content format
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total_tokens += estimate_tokens(part.get("text", ""))
+    return total_tokens
+
+def build_context_status(model_name: str, used_tokens: int) -> dict:
+    """
+    Build a context status dictionary with usage and remaining capacity.
+    """
+    limit = get_model_context_limit(model_name)
+    remaining = max(limit - used_tokens, 0)
+    percentage = round((used_tokens / limit) * 100, 2) if limit else 0.0
+    status = "ok"
+    if percentage >= 90:
+        status = "critical"
+    elif percentage >= 75:
+        status = "warning"
+    display = f"{used_tokens:,}/{limit:,} tokens used"
+    next_steps = ""
+    if status == "warning":
+        next_steps = "Consider trimming your messages or switching to a model with a larger context window."
+    elif status == "critical":
+        next_steps = "Stop the chat, switch to a higher context model, or reset the conversation to avoid errors."
+    return {
+        "limit": limit,
+        "used": used_tokens,
+        "remaining": remaining,
+        "percentage_used": percentage,
+        "status": status,
+        "display": display,
+        "next_steps": next_steps
+    }
+
 # --- Dashboard Authentication ---
 
 async def get_current_session(request: Request):
@@ -1309,23 +1428,44 @@ async def health_check():
         }
 
 @app.get("/api/v1/models")
-async def list_models(api_key: dict = Depends(rate_limit_api_key)):
+async def list_models(conversation_id: Optional[str] = None, api_key: dict = Depends(rate_limit_api_key)):
     models = get_models()
     # Filter for text-based models with an organization (exclude stealth models)
     text_models = [m for m in models 
                    if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')
                    and m.get('organization')]
     
+    api_key_str = api_key["key"]
+    session = chat_sessions[api_key_str].get(conversation_id) if conversation_id else None
+    session_model = session.get("model") if session else None
+    session_context = session.get("context_status") if session else None
+    if session and not session_context:
+        used_tokens = calculate_conversation_tokens(session.get("messages", []))
+        session_context = build_context_status(session_model or "", used_tokens)
+    
+    data = []
+    for model in text_models:
+        model_name = model.get("publicName")
+        if not model_name:
+            continue
+        limit = get_model_context_limit(model_name)
+        if session_model == model_name and session_context:
+            context_status = session_context
+        else:
+            context_status = build_context_status(model_name, 0)
+        data.append({
+            "id": model_name,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": model.get("organization", "external_provider"),
+            "context_window": limit,
+            "context_window_display": f"{limit:,} tokens",
+            "context_status": context_status
+        })
+    
     return {
         "object": "list",
-        "data": [
-            {
-                "id": model.get("publicName"),
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": model.get("organization", "external_provider")
-            } for model in text_models if model.get("publicName")
-        ]
+        "data": data
     }
 
 @app.post("/api/v1/chat/completions")
@@ -1471,6 +1611,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             debug_print(f"❌ {error_msg}")
             raise HTTPException(status_code=400, detail=error_msg)
         
+        prompt_tokens = estimate_tokens(prompt)
+        context_limit = get_model_context_limit(model_public_name)
+        debug_print(f"🧮 Prompt tokens (est.): {prompt_tokens}")
+        debug_print(f"📏 Context window (est.): {context_limit}")
+        existing_tokens = 0
+        completion_tokens = 0
+        
         # Use API key + conversation tracking
         api_key_str = api_key["key"]
         
@@ -1493,6 +1640,24 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         
         # Check if conversation exists for this API key
         session = chat_sessions[api_key_str].get(conversation_id)
+        
+        if session:
+            existing_tokens = session.get("context_status", {}).get("used", 0)
+            if existing_tokens == 0:
+                existing_tokens = calculate_conversation_tokens(session.get("messages", []))
+        else:
+            existing_tokens = 0
+        conversation_tokens_before = existing_tokens + prompt_tokens
+        debug_print(f"🎯 Conversation tokens before request (est.): {conversation_tokens_before}")
+        context_status_before = build_context_status(model_public_name, conversation_tokens_before)
+        
+        if conversation_tokens_before >= context_limit:
+            error_msg = (
+                f"Conversation is at {context_status_before['display']} for model '{model_public_name}'. "
+                "Please reset the session or choose a model with a larger context window before sending more messages."
+            )
+            debug_print(f"❌ {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
         
         if not session:
             debug_print("🆕 Creating NEW conversation session")
@@ -1546,133 +1711,152 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             debug_print(f"📦 Payload structure: Simple userMessage format")
             debug_print(f" Full payload: {json.dumps(payload, indent=2)}")
 
-        debug_print(f"\n🚀 Making API request to upstream service...")
-        debug_print(f"⏱️  Timeout set to: 120 seconds")
-        
-        # Handle streaming mode
-        if stream:
-            async def generate_stream():
-                response_text = ""
-                chunk_id = f"chatcmpl-{uuid.uuid4()}"
-                
-                async with httpx.AsyncClient() as client:
-                    try:
-                        debug_print("📡 Sending POST request for streaming...")
-                        async with client.stream('POST', url, json=payload, headers=headers, timeout=120) as response:
-                            debug_print(f"✅ Stream opened - Status: {response.status_code}")
-                            response.raise_for_status()
-                            
-                            async for line in response.aiter_lines():
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                
-                                # Parse text chunks: a0:"Hello "
-                                if line.startswith("a0:"):
-                                    chunk_data = line[3:]
-                                    try:
-                                        text_chunk = json.loads(chunk_data)
-                                        response_text += text_chunk
-                                        
-                                        # Send SSE-formatted chunk
-                                        chunk_response = {
-                                            "id": chunk_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": model_public_name,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {
-                                                    "content": text_chunk
-                                                },
-                                                "finish_reason": None
-                                            }]
-                                        }
-                                        yield f"data: {json.dumps(chunk_response)}\n\n"
-                                        
-                                    except json.JSONDecodeError:
+            debug_print(f"\n🚀 Making API request to upstream service...")
+            debug_print(f"⏱️  Timeout set to: 120 seconds")
+
+            context_status_after = context_status_before
+            request_usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 0,
+                "total_tokens": prompt_tokens
+            }
+
+            # Handle streaming mode
+            if stream:
+                async def generate_stream():
+                    nonlocal context_status_after, request_usage, completion_tokens, existing_tokens
+                    response_text = ""
+                    chunk_id = f"chatcmpl-{uuid.uuid4()}"
+
+                    async with httpx.AsyncClient() as client:
+                        try:
+                            debug_print("📡 Sending POST request for streaming...")
+                            async with client.stream('POST', url, json=payload, headers=headers, timeout=120) as response:
+                                debug_print(f"✅ Stream opened - Status: {response.status_code}")
+                                response.raise_for_status()
+
+                                async for line in response.aiter_lines():
+                                    line = line.strip()
+                                    if not line:
                                         continue
-                                
-                                # Parse error messages
-                                elif line.startswith("a3:"):
-                                    error_data = line[3:]
-                                    try:
-                                        error_message = json.loads(error_data)
-                                        print(f"  ❌ Error in stream: {error_message}")
-                                    except json.JSONDecodeError:
-                                        pass
-                                
-                                # Parse metadata for finish
-                                elif line.startswith("ad:"):
-                                    metadata_data = line[3:]
-                                    try:
-                                        metadata = json.loads(metadata_data)
-                                        finish_reason = metadata.get("finishReason", "stop")
-                                        
-                                        # Send final chunk with finish_reason
-                                        final_chunk = {
-                                            "id": chunk_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": model_public_name,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {},
-                                                "finish_reason": finish_reason
-                                            }]
-                                        }
-                                        yield f"data: {json.dumps(final_chunk)}\n\n"
-                                    except json.JSONDecodeError:
-                                        continue
-                            
-                            # Update session - Store message history with IDs
-                            if not session:
-                                chat_sessions[api_key_str][conversation_id] = {
-                                    "conversation_id": session_id,
-                                    "model": model_public_name,
-                                    "messages": [
-                                        {"id": user_msg_id, "role": "user", "content": prompt},
-                                        {"id": model_msg_id, "role": "assistant", "content": response_text.strip()}
-                                    ]
+
+                                    if line.startswith("a0:"):
+                                        chunk_data = line[3:]
+                                        try:
+                                            text_chunk = json.loads(chunk_data)
+                                            response_text += text_chunk
+
+                                            completion_tokens = estimate_tokens(response_text)
+                                            request_usage["completion_tokens"] = completion_tokens
+                                            request_usage["total_tokens"] = prompt_tokens + completion_tokens
+                                            total_tokens = existing_tokens + request_usage["total_tokens"]
+                                            context_status_after = build_context_status(model_public_name, total_tokens)
+
+                                            chunk_response = {
+                                                "id": chunk_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": model_public_name,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "content": text_chunk
+                                                    },
+                                                    "finish_reason": None
+                                                }],
+                                                "usage": request_usage,
+                                                "context_status": context_status_after
+                                            }
+                                            yield f"data: {json.dumps(chunk_response)}\n\n"
+
+                                        except json.JSONDecodeError:
+                                            continue
+
+                                    elif line.startswith("a3:"):
+                                        error_data = line[3:]
+                                        try:
+                                            error_message = json.loads(error_data)
+                                            print(f"  ❌ Error in stream: {error_message}")
+                                        except json.JSONDecodeError:
+                                            pass
+
+                                    elif line.startswith("ad:"):
+                                        metadata_data = line[3:]
+                                        try:
+                                            metadata = json.loads(metadata_data)
+                                            finish_reason = metadata.get("finishReason", "stop")
+
+                                            final_chunk = {
+                                                "id": chunk_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": model_public_name,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {},
+                                                    "finish_reason": finish_reason
+                                                }],
+                                                "usage": request_usage,
+                                                "context_status": context_status_after
+                                            }
+                                            yield f"data: {json.dumps(final_chunk)}\n\n"
+                                        except json.JSONDecodeError:
+                                            continue
+
+                                cleaned_response = response_text.strip()
+
+                                if not session:
+                                    chat_sessions[api_key_str][conversation_id] = {
+                                        "conversation_id": session_id,
+                                        "model": model_public_name,
+                                        "messages": [
+                                            {"id": user_msg_id, "role": "user", "content": prompt},
+                                            {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
+                                        ],
+                                        "context_status": context_status_after,
+                                        "last_usage": request_usage.copy(),
+                                        "updated_at": time.time()
+                                    }
+                                    debug_print(f"💾 Saved new session for conversation {conversation_id}")
+                                else:
+                                    chat_sessions[api_key_str][conversation_id]["messages"].append(
+                                        {"id": user_msg_id, "role": "user", "content": prompt}
+                                    )
+                                    chat_sessions[api_key_str][conversation_id]["messages"].append(
+                                        {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
+                                    )
+                                    chat_sessions[api_key_str][conversation_id]["context_status"] = context_status_after
+                                    chat_sessions[api_key_str][conversation_id]["last_usage"] = request_usage.copy()
+                                    chat_sessions[api_key_str][conversation_id]["updated_at"] = time.time()
+                                    debug_print(f"💾 Updated existing session for conversation {conversation_id}")
+
+                                yield "data: [DONE]\n\n"
+                                debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
+
+                        except httpx.HTTPStatusError as e:
+                            error_msg = f"Upstream service error: {e.response.status_code}"
+                            print(f"❌ {error_msg}")
+                            error_chunk = {
+                                "error": {
+                                    "message": error_msg,
+                                    "type": "api_error",
+                                    "code": e.response.status_code
                                 }
-                                debug_print(f"💾 Saved new session for conversation {conversation_id}")
-                            else:
-                                # Append new messages to history
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    {"id": user_msg_id, "role": "user", "content": prompt}
-                                )
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    {"id": model_msg_id, "role": "assistant", "content": response_text.strip()}
-                                )
-                                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
-                            
-                            yield "data: [DONE]\n\n"
-                            debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
-                            
-                    except httpx.HTTPStatusError as e:
-                        error_msg = f"Upstream service error: {e.response.status_code}"
-                        print(f"❌ {error_msg}")
-                        error_chunk = {
-                            "error": {
-                                "message": error_msg,
-                                "type": "api_error",
-                                "code": e.response.status_code
                             }
-                        }
-                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                    except Exception as e:
-                        print(f"❌ Stream error: {str(e)}")
-                        error_chunk = {
-                            "error": {
-                                "message": str(e),
-                                "type": "internal_error"
+                            yield f"data: {json.dumps(error_chunk)}\n\n"
+                        except Exception as e:
+                            print(f"❌ Stream error: {str(e)}")
+                            error_chunk = {
+                                "error": {
+                                    "message": str(e),
+                                    "type": "internal_error"
+                                }
                             }
-                        }
-                        yield f"data: {json.dumps(error_chunk)}\n\n"
-            
-            return StreamingResponse(generate_stream(), media_type="text/event-stream")
-        
-        # Handle non-streaming mode (original code)
+                            yield f"data: {json.dumps(error_chunk)}\n\n"
+
+                return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+            # Handle non-streaming mode (original code)
         async with httpx.AsyncClient() as client:
             try:
                 debug_print("📡 Sending POST request...")
@@ -1778,6 +1962,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 else:
                     debug_print(f"✅ Response text preview: {response_text[:200]}...")
                 
+                cleaned_response = response_text.strip()
+                completion_tokens = estimate_tokens(cleaned_response)
+                request_usage["completion_tokens"] = completion_tokens
+                request_usage["total_tokens"] = prompt_tokens + completion_tokens
+                total_tokens = existing_tokens + request_usage["total_tokens"]
+                context_status_after = build_context_status(model_public_name, total_tokens)
+                
                 # Update session - Store message history with IDs
                 if not session:
                     chat_sessions[api_key_str][conversation_id] = {
@@ -1785,8 +1976,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         "model": model_public_name,
                         "messages": [
                             {"id": user_msg_id, "role": "user", "content": prompt},
-                            {"id": model_msg_id, "role": "assistant", "content": response_text.strip()}
-                        ]
+                            {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
+                        ],
+                        "context_status": context_status_after,
+                        "last_usage": request_usage.copy(),
+                        "updated_at": time.time()
                     }
                     debug_print(f"💾 Saved new session for conversation {conversation_id}")
                 else:
@@ -1795,8 +1989,11 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         {"id": user_msg_id, "role": "user", "content": prompt}
                     )
                     chat_sessions[api_key_str][conversation_id]["messages"].append(
-                        {"id": model_msg_id, "role": "assistant", "content": response_text.strip()}
+                        {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
                     )
+                    chat_sessions[api_key_str][conversation_id]["context_status"] = context_status_after
+                    chat_sessions[api_key_str][conversation_id]["last_usage"] = request_usage.copy()
+                    chat_sessions[api_key_str][conversation_id]["updated_at"] = time.time()
                     debug_print(f"💾 Updated existing session for conversation {conversation_id}")
 
                 final_response = {
@@ -1809,15 +2006,12 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": response_text.strip(),
+                            "content": cleaned_response,
                         },
                         "finish_reason": "stop"
                     }],
-                    "usage": {
-                        "prompt_tokens": len(prompt),
-                        "completion_tokens": len(response_text),
-                        "total_tokens": len(prompt) + len(response_text)
-                    }
+                    "usage": request_usage.copy(),
+                    "context_status": context_status_after
                 }
                 
                 debug_print(f"\n✅ REQUEST COMPLETED SUCCESSFULLY")
@@ -1886,6 +2080,39 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         print(f"📛 Error message: {str(e)}")
         print("="*80 + "\n")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/api/v1/conversations/{conversation_id}/status")
+async def get_conversation_status(conversation_id: str, api_key: dict = Depends(rate_limit_api_key)):
+    api_key_str = api_key["key"]
+    session = chat_sessions[api_key_str].get(conversation_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Conversation not found or expired.")
+
+    model_name = session.get("model", "")
+    messages = session.get("messages", [])
+
+    context_status = session.get("context_status")
+    if not context_status:
+        used_tokens = calculate_conversation_tokens(messages)
+        context_status = build_context_status(model_name, used_tokens)
+    else:
+        used_tokens = context_status.get("used", calculate_conversation_tokens(messages))
+        context_status = build_context_status(model_name, used_tokens)
+
+    last_usage = session.get("last_usage") or {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": used_tokens
+    }
+
+    return {
+        "conversation_id": conversation_id,
+        "model": model_name,
+        "messages": len(messages),
+        "context_status": context_status,
+        "usage": last_usage,
+        "updated_at": session.get("updated_at")
+    }
 
 if __name__ == "__main__":
     print("=" * 60)

@@ -90,6 +90,16 @@ You can use this project as a backend for [OpenWebUI](https://openwebui.com/), a
 5.  **Start Chatting:**
     You should now be able to select and chat with the models available on LM Arena through OpenWebUI.
 
+### Context Awareness & Token Tracking
+
+LMArenaBridge now surfaces context window details to help you avoid exhausting the conversation buffer:
+
+- `GET /api/v1/models` returns each model's estimated context window along with a `context_status` block (usage, remaining capacity, and actionable guidance). Pass an optional `conversation_id` query parameter to see the active session's usage when selecting models.
+- `POST /api/v1/chat/completions` responses and streaming chunks include `usage` and `context_status` objects so clients can display real-time token consumption (for both synchronous and streaming chats).
+- `GET /api/v1/conversations/{conversation_id}/status` exposes the latest totals for an active conversation, making it easy to poll and present live context status in your UI.
+
+Use these fields to warn users before they hit limits, switch to higher-capacity models, or reset chats proactively.
+
 ## Image Support
 
 LMArenaBridge supports sending images to vision-capable models on LMArena. When you send a message with images to a model that supports image input, the images are automatically uploaded to LMArena's R2 storage and included in the request.
@@ -211,3 +221,127 @@ sudo systemctl enable lmarenabridge
 sudo systemctl start lmarenabridge
 sudo systemctl status lmarenabridge
 ```
+
+## API Reference
+
+### Context Status Feature
+
+#### GET /api/v1/models
+
+Lists available models with their context windows and current usage status.
+
+**Query Parameters:**
+- `conversation_id` (optional): Pass conversation ID to see context usage for that conversation
+
+**Response Example:**
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-4",
+      "object": "model",
+      "created": 1704067200,
+      "owned_by": "openai",
+      "context_window": 128000,
+      "context_window_display": "128,000 tokens",
+      "context_status": {
+        "limit": 128000,
+        "used": 1500,
+        "remaining": 126500,
+        "percentage_used": 1.17,
+        "status": "ok",
+        "display": "1,500/128,000 tokens used",
+        "next_steps": ""
+      }
+    }
+  ]
+}
+```
+
+**Context Status Fields:**
+- `limit`: Maximum tokens for this model
+- `used`: Current tokens used in the conversation
+- `remaining`: Available tokens remaining
+- `percentage_used`: Percentage of context used
+- `status`: One of `ok`, `warning` (≥75%), or `critical` (≥90%)
+- `display`: Human-readable usage string
+- `next_steps`: Actionable advice when approaching limits
+
+#### POST /api/v1/chat/completions
+
+Chat completions endpoint with context tracking.
+
+**Response Fields (in addition to OpenAI format):**
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1704067200,
+  "model": "gpt-4",
+  "conversation_id": "abc123...",
+  "choices": [...],
+  "usage": {
+    "prompt_tokens": 150,
+    "completion_tokens": 200,
+    "total_tokens": 350
+  },
+  "context_status": {
+    "limit": 128000,
+    "used": 1850,
+    "remaining": 126150,
+    "percentage_used": 1.45,
+    "status": "ok",
+    "display": "1,850/128,000 tokens used",
+    "next_steps": ""
+  }
+}
+```
+
+For streaming responses, each chunk includes `usage` and `context_status` fields.
+
+#### GET /api/v1/conversations/{conversation_id}/status
+
+Get current context status for a conversation.
+
+**Response Example:**
+```json
+{
+  "conversation_id": "abc123...",
+  "model": "gpt-4",
+  "messages": 6,
+  "context_status": {
+    "limit": 128000,
+    "used": 2450,
+    "remaining": 125550,
+    "percentage_used": 1.91,
+    "status": "ok",
+    "display": "2,450/128,000 tokens used",
+    "next_steps": ""
+  },
+  "usage": {
+    "prompt_tokens": 350,
+    "completion_tokens": 450,
+    "total_tokens": 800
+  },
+  "updated_at": 1704067200.123
+}
+```
+
+### Context Window Limits by Model Family
+
+The bridge automatically detects context limits for common model families:
+
+| Model Family | Default Context Window |
+|--------------|------------------------|
+| GPT-4/GPT-4o | 128,000 tokens |
+| GPT-3.5 | 4,096 tokens (16K for 16k variants) |
+| Claude 3/3.5 | 200,000 tokens |
+| Gemini 2.0/2.5 | 1,000,000 tokens |
+| Gemini 1.5 Pro | 2,000,000 tokens |
+| Llama 3.1/3.3 | 128,000 tokens |
+| Mistral Large | 128,000 tokens |
+| DeepSeek v3 | 64,000 tokens |
+| Other models | 32,768 tokens (default) |
+
+**Note:** Token estimates use character-based approximation (1 token ≈ 4 characters). Actual token counts may vary slightly depending on the model's tokenizer.

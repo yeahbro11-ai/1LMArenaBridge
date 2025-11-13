@@ -17,6 +17,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, StreamingRespons
 from fastapi.security import APIKeyHeader
 
 import httpx
+from proxy_manager import ProxyConfig, init_proxy_manager, get_proxy_manager
 
 # ============================================================
 # CONFIGURATION
@@ -50,6 +51,19 @@ def uuid7():
     hex_str = f"{uuid_int:032x}"
     return f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
 
+# Proxy-enabled httpx client creation
+async def create_proxy_client() -> httpx.AsyncClient:
+    """Create an httpx client with proxy rotation"""
+    proxy_manager = get_proxy_manager()
+    if proxy_manager:
+        proxy_config = await proxy_manager.get_next_proxy()
+        if proxy_config:
+            debug_print(f"🌐 Using proxy: {proxy_config}")
+            return httpx.AsyncClient(proxy=proxy_config, timeout=30.0)
+    
+    debug_print("🌐 No proxy available, using direct connection")
+    return httpx.AsyncClient(timeout=30.0)
+
 # Image upload helper functions
 async def upload_image_to_lmarena(image_data: bytes, mime_type: str, filename: str) -> Optional[tuple]:
     """
@@ -63,125 +77,143 @@ async def upload_image_to_lmarena(image_data: bytes, mime_type: str, filename: s
     Returns:
         Tuple of (key, download_url) if successful, or None if upload fails
     """
+    # Validate inputs
+    if not image_data:
+        debug_print("❌ Image data is empty")
+        return None
+    
+    if not mime_type or not mime_type.startswith('image/'):
+        debug_print(f"❌ Invalid MIME type: {mime_type}")
+        return None
+    
+    # Step 1: Request upload URL
+    debug_print(f"📤 Step 1: Requesting upload URL for {filename}")
+    
+    # Prepare headers for Next.js Server Action
+    request_headers = get_request_headers()
+    request_headers.update({
+        "Accept": "text/x-component",
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Next-Action": "70cb393626e05a5f0ce7dcb46977c36c139fa85f91",
+        "Referer": "https://lmarena.ai/?mode=direct",
+    })
+    
+    client = None
     try:
-        # Validate inputs
-        if not image_data:
-            debug_print("❌ Image data is empty")
+        client = await create_proxy_client()
+        try:
+            response = await client.post(
+                "https://lmarena.ai/?mode=direct",
+                headers=request_headers,
+                content=json.dumps([filename, mime_type]),
+                timeout=30.0
+            )
+            response.raise_for_status()
+            
+            # Mark proxy as successful if we have one
+            if hasattr(client, '_proxy_config') and client._proxy_config:
+                proxy_manager = get_proxy_manager()
+                if proxy_manager:
+                    await proxy_manager.mark_proxy_success(client._proxy_config)
+                    
+        except (httpx.TimeoutException, httpx.HTTPError) as e:
+            debug_print(f"❌ Error while requesting upload URL: {e}")
+            # Mark proxy as failed if we have one
+            if hasattr(client, '_proxy_config') and client._proxy_config:
+                proxy_manager = get_proxy_manager()
+                if proxy_manager:
+                    await proxy_manager.mark_proxy_failed(client._proxy_config)
             return None
         
-        if not mime_type or not mime_type.startswith('image/'):
-            debug_print(f"❌ Invalid MIME type: {mime_type}")
+        # Parse response - format: 0:{...}\n1:{...}\n
+        try:
+            lines = response.text.strip().split('\n')
+            upload_data = None
+            for line in lines:
+                if line.startswith('1:'):
+                    upload_data = json.loads(line[2:])
+                    break
+            
+            if not upload_data or not upload_data.get('success'):
+                debug_print(f"❌ Failed to get upload URL: {response.text[:200]}")
+                return None
+            
+            upload_url = upload_data['data']['uploadUrl']
+            key = upload_data['data']['key']
+            debug_print(f"✅ Got upload URL and key: {key}")
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            debug_print(f"❌ Failed to parse upload URL response: {e}")
             return None
         
-        # Step 1: Request upload URL
-        debug_print(f"📤 Step 1: Requesting upload URL for {filename}")
+        # Step 2: Upload image to R2 storage
+        debug_print(f"📤 Step 2: Uploading image to R2 storage ({len(image_data)} bytes)")
+        try:
+            response = await client.put(
+                upload_url,
+                content=image_data,
+                headers={"Content-Type": mime_type},
+                timeout=60.0
+            )
+            response.raise_for_status()
+            debug_print(f"✅ Image uploaded successfully")
+        except (httpx.TimeoutException, httpx.HTTPError) as e:
+            debug_print(f"❌ Error while uploading image to R2 storage: {e}")
+            # Mark proxy as failed if we have one
+            if hasattr(client, '_proxy_config') and client._proxy_config:
+                proxy_manager = get_proxy_manager()
+                if proxy_manager:
+                    await proxy_manager.mark_proxy_failed(client._proxy_config)
+            return None
         
-        # Prepare headers for Next.js Server Action
-        request_headers = get_request_headers()
-        request_headers.update({
-            "Accept": "text/x-component",
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Next-Action": "70cb393626e05a5f0ce7dcb46977c36c139fa85f91",
-            "Referer": "https://lmarena.ai/?mode=direct",
-        })
+        # Step 3: Get signed download URL (uses different Next-Action)
+        debug_print(f"📤 Step 3: Requesting signed download URL")
+        request_headers_step3 = request_headers.copy()
+        request_headers_step3["Next-Action"] = "6064c365792a3eaf40a60a874b327fe031ea6f22d7"
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    "https://lmarena.ai/?mode=direct",
-                    headers=request_headers,
-                    content=json.dumps([filename, mime_type]),
-                    timeout=30.0
-                )
-                response.raise_for_status()
-            except httpx.TimeoutException:
-                debug_print("❌ Timeout while requesting upload URL")
-                return None
-            except httpx.HTTPError as e:
-                debug_print(f"❌ HTTP error while requesting upload URL: {e}")
+        try:
+            response = await client.post(
+                "https://lmarena.ai/?mode=direct",
+                headers=request_headers_step3,
+                content=json.dumps([key]),
+                timeout=30.0
+            )
+            response.raise_for_status()
+        except (httpx.TimeoutException, httpx.HTTPError) as e:
+            debug_print(f"❌ Error while requesting download URL: {e}")
+            # Mark proxy as failed if we have one
+            if hasattr(client, '_proxy_config') and client._proxy_config:
+                proxy_manager = get_proxy_manager()
+                if proxy_manager:
+                    await proxy_manager.mark_proxy_failed(client._proxy_config)
+            return None
+        
+        # Parse response
+        try:
+            lines = response.text.strip().split('\n')
+            download_data = None
+            for line in lines:
+                if line.startswith('1:'):
+                    download_data = json.loads(line[2:])
+                    break
+            
+            if not download_data or not download_data.get('success'):
+                debug_print(f"❌ Failed to get download URL: {response.text[:200]}")
                 return None
             
-            # Parse response - format: 0:{...}\n1:{...}\n
-            try:
-                lines = response.text.strip().split('\n')
-                upload_data = None
-                for line in lines:
-                    if line.startswith('1:'):
-                        upload_data = json.loads(line[2:])
-                        break
-                
-                if not upload_data or not upload_data.get('success'):
-                    debug_print(f"❌ Failed to get upload URL: {response.text[:200]}")
-                    return None
-                
-                upload_url = upload_data['data']['uploadUrl']
-                key = upload_data['data']['key']
-                debug_print(f"✅ Got upload URL and key: {key}")
-            except (json.JSONDecodeError, KeyError, IndexError) as e:
-                debug_print(f"❌ Failed to parse upload URL response: {e}")
-                return None
-            
-            # Step 2: Upload image to R2 storage
-            debug_print(f"📤 Step 2: Uploading image to R2 storage ({len(image_data)} bytes)")
-            try:
-                response = await client.put(
-                    upload_url,
-                    content=image_data,
-                    headers={"Content-Type": mime_type},
-                    timeout=60.0
-                )
-                response.raise_for_status()
-                debug_print(f"✅ Image uploaded successfully")
-            except httpx.TimeoutException:
-                debug_print("❌ Timeout while uploading image to R2 storage")
-                return None
-            except httpx.HTTPError as e:
-                debug_print(f"❌ HTTP error while uploading image: {e}")
-                return None
-            
-            # Step 3: Get signed download URL (uses different Next-Action)
-            debug_print(f"📤 Step 3: Requesting signed download URL")
-            request_headers_step3 = request_headers.copy()
-            request_headers_step3["Next-Action"] = "6064c365792a3eaf40a60a874b327fe031ea6f22d7"
-            
-            try:
-                response = await client.post(
-                    "https://lmarena.ai/?mode=direct",
-                    headers=request_headers_step3,
-                    content=json.dumps([key]),
-                    timeout=30.0
-                )
-                response.raise_for_status()
-            except httpx.TimeoutException:
-                debug_print("❌ Timeout while requesting download URL")
-                return None
-            except httpx.HTTPError as e:
-                debug_print(f"❌ HTTP error while requesting download URL: {e}")
-                return None
-            
-            # Parse response
-            try:
-                lines = response.text.strip().split('\n')
-                download_data = None
-                for line in lines:
-                    if line.startswith('1:'):
-                        download_data = json.loads(line[2:])
-                        break
-                
-                if not download_data or not download_data.get('success'):
-                    debug_print(f"❌ Failed to get download URL: {response.text[:200]}")
-                    return None
-                
-                download_url = download_data['data']['url']
-                debug_print(f"✅ Got signed download URL: {download_url[:100]}...")
-                return (key, download_url)
-            except (json.JSONDecodeError, KeyError, IndexError) as e:
-                debug_print(f"❌ Failed to parse download URL response: {e}")
-                return None
-            
+            download_url = download_data['data']['url']
+            debug_print(f"✅ Got signed download URL: {download_url[:100]}...")
+            return (key, download_url)
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            debug_print(f"❌ Failed to parse download URL response: {e}")
+            return None
+    
     except Exception as e:
         debug_print(f"❌ Unexpected error uploading image: {type(e).__name__}: {e}")
         return None
+    finally:
+        # Always close the client
+        if client:
+            await client.aclose()
 
 async def process_message_content(content, model_capabilities: dict) -> tuple[str, List[dict]]:
     """
@@ -324,6 +356,7 @@ def get_config():
     config.setdefault("cf_clearance", "")
     config.setdefault("api_keys", [])
     config.setdefault("usage_stats", {})
+    config.setdefault("proxies", [])
     
     return config
 
@@ -604,10 +637,29 @@ async def periodic_refresh_task():
 @app.on_event("startup")
 async def startup_event():
     # Ensure config and models files exist
-    save_config(get_config())
+    config = get_config()
+    save_config(config)
     save_models(get_models())
     # Load usage stats from config
     load_usage_stats()
+    
+    # Initialize proxy manager
+    proxy_configs = []
+    for proxy_config in config.get("proxies", []):
+        proxy_configs.append(ProxyConfig(
+            url=proxy_config.get("url", ""),
+            username=proxy_config.get("username"),
+            password=proxy_config.get("password"),
+            max_failures=proxy_config.get("max_failures", 3),
+            timeout=proxy_config.get("timeout", 30)
+        ))
+    
+    if proxy_configs:
+        init_proxy_manager(proxy_configs)
+        debug_print(f"✅ Initialized proxy manager with {len(proxy_configs)} proxies")
+    else:
+        debug_print("⚠️ No proxy configurations found")
+    
     # Start initial data fetch
     asyncio.create_task(get_initial_data())
     # Start periodic refresh task (every 30 minutes)
@@ -759,6 +811,25 @@ async def dashboard(session: str = Depends(get_current_session)):
 
     config = get_config()
     models = get_models()
+    
+    # Get proxy status
+    proxy_manager = get_proxy_manager()
+    proxy_stats_html = ""
+    if proxy_manager:
+        stats = proxy_manager.get_stats()
+        proxy_stats_html = f"""
+            <div class="stat-card">
+                <div class="stat-value">{stats['working_proxies']}/{stats['total_proxies']}</div>
+                <div class="stat-label">Working Proxies</div>
+            </div>
+        """
+    else:
+        proxy_stats_html = """
+            <div class="stat-card">
+                <div class="stat-value">0</div>
+                <div class="stat-label">No Proxies</div>
+            </div>
+        """
 
     # Render API Keys
     keys_html = ""
@@ -1129,6 +1200,7 @@ async def dashboard(session: str = Depends(get_current_session)):
                         <div class="stat-value">{sum(model_usage_stats.values())}</div>
                         <div class="stat-label">Total Requests</div>
                     </div>
+                    {proxy_stats_html}
                 </div>
 
                 <!-- Authentication Token -->
@@ -1393,6 +1465,26 @@ async def refresh_tokens(session: str = Depends(get_current_session)):
         return RedirectResponse(url="/login")
     await get_initial_data()
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.get("/api/v1/proxy-status")
+async def get_proxy_status(api_key: dict = Depends(rate_limit_api_key)):
+    """Get current proxy rotation status and statistics"""
+    proxy_manager = get_proxy_manager()
+    if not proxy_manager:
+        return {
+            "enabled": False,
+            "message": "Proxy rotation is not configured"
+        }
+    
+    stats = proxy_manager.get_stats()
+    return {
+        "enabled": True,
+        "total_proxies": stats["total_proxies"],
+        "working_proxies": stats["working_proxies"],
+        "failed_proxies": stats["failed_proxies"],
+        "failure_counts": stats["failure_counts"],
+        "last_used": {k: time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(v)) for k, v in stats["last_used"].items()}
+    }
 
 # --- OpenAI Compatible API Endpoints ---
 
@@ -1728,350 +1820,412 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     response_text = ""
                     chunk_id = f"chatcmpl-{uuid.uuid4()}"
 
-                    async with httpx.AsyncClient() as client:
-                        try:
-                            debug_print("📡 Sending POST request for streaming...")
-                            async with client.stream('POST', url, json=payload, headers=headers, timeout=120) as response:
-                                debug_print(f"✅ Stream opened - Status: {response.status_code}")
-                                response.raise_for_status()
+                    client = await create_proxy_client()
+                    client._proxy_config = None  # Store proxy config for tracking
+                    
+                    try:
+                        # Get proxy config for tracking
+                        proxy_manager = get_proxy_manager()
+                        if proxy_manager:
+                            proxy_config = await proxy_manager.get_next_proxy()
+                            if proxy_config:
+                                client = httpx.AsyncClient(proxy=proxy_config, timeout=120)
+                                client._proxy_config = proxy_config
+                        
+                        debug_print("📡 Sending POST request for streaming...")
+                        async with client.stream('POST', url, json=payload, headers=headers, timeout=120) as response:
+                            debug_print(f"✅ Stream opened - Status: {response.status_code}")
+                            response.raise_for_status()
+                            
+                            async for line in response.aiter_lines():
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                
+                                if line.startswith("a0:"):
+                                    chunk_data = line[3:]
+                                    try:
+                                        text_chunk = json.loads(chunk_data)
+                                        response_text += text_chunk
 
-                                async for line in response.aiter_lines():
-                                    line = line.strip()
-                                    if not line:
+                                        completion_tokens = estimate_tokens(response_text)
+                                        request_usage["completion_tokens"] = completion_tokens
+                                        request_usage["total_tokens"] = prompt_tokens + completion_tokens
+                                        total_tokens = existing_tokens + request_usage["total_tokens"]
+                                        context_status_after = build_context_status(model_public_name, total_tokens)
+
+                                        chunk_response = {
+                                            "id": chunk_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": model_public_name,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": text_chunk
+                                                },
+                                                "finish_reason": None
+                                            }],
+                                            "usage": request_usage,
+                                            "context_status": context_status_after
+                                        }
+                                        yield f"data: {json.dumps(chunk_response)}\n\n"
+
+                                    except json.JSONDecodeError:
                                         continue
 
-                                    if line.startswith("a0:"):
-                                        chunk_data = line[3:]
-                                        try:
-                                            text_chunk = json.loads(chunk_data)
-                                            response_text += text_chunk
+                                elif line.startswith("a3:"):
+                                    error_data = line[3:]
+                                    try:
+                                        error_message = json.loads(error_data)
+                                        print(f"  ❌ Error in stream: {error_message}")
+                                    except json.JSONDecodeError:
+                                        pass
 
-                                            completion_tokens = estimate_tokens(response_text)
-                                            request_usage["completion_tokens"] = completion_tokens
-                                            request_usage["total_tokens"] = prompt_tokens + completion_tokens
-                                            total_tokens = existing_tokens + request_usage["total_tokens"]
-                                            context_status_after = build_context_status(model_public_name, total_tokens)
+                                elif line.startswith("ad:"):
+                                    metadata_data = line[3:]
+                                    try:
+                                        metadata = json.loads(metadata_data)
+                                        finish_reason = metadata.get("finishReason", "stop")
 
-                                            chunk_response = {
-                                                "id": chunk_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": model_public_name,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {
-                                                        "content": text_chunk
-                                                    },
-                                                    "finish_reason": None
-                                                }],
-                                                "usage": request_usage,
-                                                "context_status": context_status_after
-                                            }
-                                            yield f"data: {json.dumps(chunk_response)}\n\n"
+                                        final_chunk = {
+                                            "id": chunk_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": model_public_name,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {},
+                                                "finish_reason": finish_reason
+                                            }],
+                                            "usage": request_usage,
+                                            "context_status": context_status_after
+                                        }
+                                        yield f"data: {json.dumps(final_chunk)}\n\n"
+                                    except json.JSONDecodeError:
+                                        continue
 
-                                        except json.JSONDecodeError:
-                                            continue
+                            cleaned_response = response_text.strip()
 
-                                    elif line.startswith("a3:"):
-                                        error_data = line[3:]
-                                        try:
-                                            error_message = json.loads(error_data)
-                                            print(f"  ❌ Error in stream: {error_message}")
-                                        except json.JSONDecodeError:
-                                            pass
-
-                                    elif line.startswith("ad:"):
-                                        metadata_data = line[3:]
-                                        try:
-                                            metadata = json.loads(metadata_data)
-                                            finish_reason = metadata.get("finishReason", "stop")
-
-                                            final_chunk = {
-                                                "id": chunk_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": model_public_name,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {},
-                                                    "finish_reason": finish_reason
-                                                }],
-                                                "usage": request_usage,
-                                                "context_status": context_status_after
-                                            }
-                                            yield f"data: {json.dumps(final_chunk)}\n\n"
-                                        except json.JSONDecodeError:
-                                            continue
-
-                                cleaned_response = response_text.strip()
-
-                                if not session:
-                                    chat_sessions[api_key_str][conversation_id] = {
-                                        "conversation_id": session_id,
-                                        "model": model_public_name,
-                                        "messages": [
-                                            {"id": user_msg_id, "role": "user", "content": prompt},
-                                            {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
-                                        ],
-                                        "context_status": context_status_after,
-                                        "last_usage": request_usage.copy(),
-                                        "updated_at": time.time()
-                                    }
-                                    debug_print(f"💾 Saved new session for conversation {conversation_id}")
-                                else:
-                                    chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                        {"id": user_msg_id, "role": "user", "content": prompt}
-                                    )
-                                    chat_sessions[api_key_str][conversation_id]["messages"].append(
+                            if not session:
+                                chat_sessions[api_key_str][conversation_id] = {
+                                    "conversation_id": session_id,
+                                    "model": model_public_name,
+                                    "messages": [
+                                        {"id": user_msg_id, "role": "user", "content": prompt},
                                         {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
-                                    )
-                                    chat_sessions[api_key_str][conversation_id]["context_status"] = context_status_after
-                                    chat_sessions[api_key_str][conversation_id]["last_usage"] = request_usage.copy()
-                                    chat_sessions[api_key_str][conversation_id]["updated_at"] = time.time()
-                                    debug_print(f"💾 Updated existing session for conversation {conversation_id}")
-
-                                yield "data: [DONE]\n\n"
-                                debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
-
-                        except httpx.HTTPStatusError as e:
-                            error_msg = f"Upstream service error: {e.response.status_code}"
-                            print(f"❌ {error_msg}")
-                            error_chunk = {
-                                "error": {
-                                    "message": error_msg,
-                                    "type": "api_error",
-                                    "code": e.response.status_code
+                                    ],
+                                    "context_status": context_status_after,
+                                    "last_usage": request_usage.copy(),
+                                    "updated_at": time.time()
                                 }
+                                debug_print(f"💾 Saved new session for conversation {conversation_id}")
+                            else:
+                                chat_sessions[api_key_str][conversation_id]["messages"].append(
+                                    {"id": user_msg_id, "role": "user", "content": prompt}
+                                )
+                                chat_sessions[api_key_str][conversation_id]["messages"].append(
+                                    {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
+                                )
+                                chat_sessions[api_key_str][conversation_id]["context_status"] = context_status_after
+                                chat_sessions[api_key_str][conversation_id]["last_usage"] = request_usage.copy()
+                                chat_sessions[api_key_str][conversation_id]["updated_at"] = time.time()
+                                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
+
+                            yield "data: [DONE]\n\n"
+                            debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
+
+                    except httpx.HTTPStatusError as e:
+                        error_msg = f"Upstream service error: {e.response.status_code}"
+                        print(f"❌ {error_msg}")
+                        # Mark proxy as failed if we have one
+                        if hasattr(client, '_proxy_config') and client._proxy_config:
+                            proxy_manager = get_proxy_manager()
+                            if proxy_manager:
+                                await proxy_manager.mark_proxy_failed(client._proxy_config)
+                        error_chunk = {
+                            "error": {
+                                "message": error_msg,
+                                "type": "api_error",
+                                "code": e.response.status_code
                             }
-                            yield f"data: {json.dumps(error_chunk)}\n\n"
-                        except Exception as e:
-                            print(f"❌ Stream error: {str(e)}")
-                            error_chunk = {
-                                "error": {
-                                    "message": str(e),
-                                    "type": "internal_error"
-                                }
+                        }
+                        yield f"data: {json.dumps(error_chunk)}\n\n"
+                    except Exception as e:
+                        print(f"❌ Stream error: {str(e)}")
+                        # Mark proxy as failed if we have one
+                        if hasattr(client, '_proxy_config') and client._proxy_config:
+                            proxy_manager = get_proxy_manager()
+                            if proxy_manager:
+                                await proxy_manager.mark_proxy_failed(client._proxy_config)
+                        error_chunk = {
+                            "error": {
+                                "message": str(e),
+                                "type": "internal_error"
                             }
-                            yield f"data: {json.dumps(error_chunk)}\n\n"
+                        }
+                        yield f"data: {json.dumps(error_chunk)}\n\n"
+                    finally:
+                        # Always close the client
+                        await client.aclose()
 
                 return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
             # Handle non-streaming mode (original code)
-        async with httpx.AsyncClient() as client:
-            try:
-                debug_print("📡 Sending POST request...")
-                response = await client.post(url, json=payload, headers=headers, timeout=120)
+        client = await create_proxy_client()
+        client._proxy_config = None  # Store proxy config for tracking
+        
+        try:
+            # Get proxy config for tracking
+            proxy_manager = get_proxy_manager()
+            if proxy_manager:
+                proxy_config = await proxy_manager.get_next_proxy()
+                if proxy_config:
+                    client = httpx.AsyncClient(proxy=proxy_config, timeout=120)
+                    client._proxy_config = proxy_config
+            
+            debug_print("📡 Sending POST request...")
+            response = await client.post(url, json=payload, headers=headers, timeout=120)
+            
+            debug_print(f"✅ Response received - Status: {response.status_code}")
+            debug_print(f"📏 Response length: {len(response.text)} characters")
+            debug_print(f"📋 Response headers: {dict(response.headers)}")
+            
+            response.raise_for_status()
+            
+            # Mark proxy as successful if we have one
+            if hasattr(client, '_proxy_config') and client._proxy_config:
+                proxy_manager = get_proxy_manager()
+                if proxy_manager:
+                    await proxy_manager.mark_proxy_success(client._proxy_config)
+            
+            debug_print(f"🔍 Processing response...")
+            debug_print(f"📄 First 500 chars of response:\n{response.text[:500]}")
+            
+            # Process response in lmarena format
+            # Format: a0:"text chunk" for content, ad:{...} for metadata
+            response_text = ""
+            finish_reason = None
+            line_count = 0
+            text_chunks_found = 0
+            metadata_found = 0
+            
+            debug_print(f"📊 Parsing response lines...")
+            
+            error_message = None
+            for line in response.text.splitlines():
+                line_count += 1
+                line = line.strip()
+                if not line:
+                    continue
                 
-                debug_print(f"✅ Response received - Status: {response.status_code}")
-                debug_print(f"📏 Response length: {len(response.text)} characters")
-                debug_print(f"📋 Response headers: {dict(response.headers)}")
-                
-                response.raise_for_status()
-                
-                debug_print(f"🔍 Processing response...")
-                debug_print(f"📄 First 500 chars of response:\n{response.text[:500]}")
-                
-                # Process response in lmarena format
-                # Format: a0:"text chunk" for content, ad:{...} for metadata
-                response_text = ""
-                finish_reason = None
-                line_count = 0
-                text_chunks_found = 0
-                metadata_found = 0
-                
-                debug_print(f"📊 Parsing response lines...")
-                
-                error_message = None
-                for line in response.text.splitlines():
-                    line_count += 1
-                    line = line.strip()
-                    if not line:
+                # Parse text chunks: a0:"Hello "
+                if line.startswith("a0:"):
+                    chunk_data = line[3:]  # Remove "a0:" prefix
+                    text_chunks_found += 1
+                    try:
+                        # Parse as JSON string (includes quotes)
+                        text_chunk = json.loads(chunk_data)
+                        response_text += text_chunk
+                        if text_chunks_found <= 3:  # Log first 3 chunks
+                            debug_print(f"  ✅ Chunk {text_chunks_found}: {repr(text_chunk[:50])}")
+                    except json.JSONDecodeError as e:
+                        debug_print(f"  ⚠️ Failed to parse text chunk on line {line_count}: {chunk_data[:100]} - {e}")
                         continue
-                    
-                    # Parse text chunks: a0:"Hello "
-                    if line.startswith("a0:"):
-                        chunk_data = line[3:]  # Remove "a0:" prefix
-                        text_chunks_found += 1
-                        try:
-                            # Parse as JSON string (includes quotes)
-                            text_chunk = json.loads(chunk_data)
-                            response_text += text_chunk
-                            if text_chunks_found <= 3:  # Log first 3 chunks
-                                debug_print(f"  ✅ Chunk {text_chunks_found}: {repr(text_chunk[:50])}")
-                        except json.JSONDecodeError as e:
-                            debug_print(f"  ⚠️ Failed to parse text chunk on line {line_count}: {chunk_data[:100]} - {e}")
-                            continue
-                    
-                    # Parse error messages: a3:"An error occurred"
-                    elif line.startswith("a3:"):
-                        error_data = line[3:]  # Remove "a3:" prefix
-                        try:
-                            error_message = json.loads(error_data)
-                            debug_print(f"  ❌ Error message received: {error_message}")
-                        except json.JSONDecodeError as e:
-                            debug_print(f"  ⚠️ Failed to parse error message on line {line_count}: {error_data[:100]} - {e}")
-                            error_message = error_data
-                    
-                    # Parse metadata: ad:{"finishReason":"stop"}
-                    elif line.startswith("ad:"):
-                        metadata_data = line[3:]  # Remove "ad:" prefix
-                        metadata_found += 1
-                        try:
-                            metadata = json.loads(metadata_data)
-                            finish_reason = metadata.get("finishReason")
-                            debug_print(f"  📋 Metadata found: finishReason={finish_reason}")
-                        except json.JSONDecodeError as e:
-                            debug_print(f"  ⚠️ Failed to parse metadata on line {line_count}: {metadata_data[:100]} - {e}")
-                            continue
-                    elif line.strip():  # Non-empty line that doesn't match expected format
-                        if line_count <= 5:  # Log first 5 unexpected lines
-                            debug_print(f"  ❓ Unexpected line format {line_count}: {line[:100]}")
+                
+                # Parse error messages: a3:"An error occurred"
+                elif line.startswith("a3:"):
+                    error_data = line[3:]  # Remove "a3:" prefix
+                    try:
+                        error_message = json.loads(error_data)
+                        debug_print(f"  ❌ Error message received: {error_message}")
+                    except json.JSONDecodeError as e:
+                        debug_print(f"  ⚠️ Failed to parse error message on line {line_count}: {error_data[:100]} - {e}")
+                        error_message = error_data
+                
+                # Parse metadata: ad:{"finishReason":"stop"}
+                elif line.startswith("ad:"):
+                    metadata_data = line[3:]  # Remove "ad:" prefix
+                    metadata_found += 1
+                    try:
+                        metadata = json.loads(metadata_data)
+                        finish_reason = metadata.get("finishReason")
+                        debug_print(f"  📋 Metadata found: finishReason={finish_reason}")
+                    except json.JSONDecodeError as e:
+                        debug_print(f"  ⚠️ Failed to parse metadata on line {line_count}: {metadata_data[:100]} - {e}")
+                        continue
+                elif line.strip():  # Non-empty line that doesn't match expected format
+                    if line_count <= 5:  # Log first 5 unexpected lines
+                        debug_print(f"  ❓ Unexpected line format {line_count}: {line[:100]}")
 
-                debug_print(f"\n📊 Parsing Summary:")
-                debug_print(f"  - Total lines: {line_count}")
-                debug_print(f"  - Text chunks found: {text_chunks_found}")
-                debug_print(f"  - Metadata entries: {metadata_found}")
-                debug_print(f"  - Final response length: {len(response_text)} chars")
-                debug_print(f"  - Finish reason: {finish_reason}")
-                
-                if not response_text:
-                    debug_print(f"\n⚠️  WARNING: Empty response text!")
-                    debug_print(f"📄 Full raw response:\n{response.text}")
-                    if error_message:
-                        error_detail = f"Upstream service error: {error_message}"
-                        print(f"❌ {error_detail}")
-                        # Return OpenAI-compatible error response
-                        return {
-                            "error": {
-                                "message": error_detail,
-                                "type": "upstream_error",
-                                "code": "upstream_error"
-                            }
+            debug_print(f"\n📊 Parsing Summary:")
+            debug_print(f"  - Total lines: {line_count}")
+            debug_print(f"  - Text chunks found: {text_chunks_found}")
+            debug_print(f"  - Metadata entries: {metadata_found}")
+            debug_print(f"  - Final response length: {len(response_text)} chars")
+            debug_print(f"  - Finish reason: {finish_reason}")
+            
+            if not response_text:
+                debug_print(f"\n⚠️  WARNING: Empty response text!")
+                debug_print(f"📄 Full raw response:\n{response.text}")
+                if error_message:
+                    error_detail = f"Upstream service error: {error_message}"
+                    print(f"❌ {error_detail}")
+                    # Return OpenAI-compatible error response
+                    return {
+                        "error": {
+                            "message": error_detail,
+                            "type": "upstream_error",
+                            "code": "upstream_error"
                         }
-                    else:
-                        error_detail = "Received empty response from upstream service. This could be due to: invalid authentication token, expired session, model unavailable, or rate limiting."
-                        debug_print(f"❌ {error_detail}")
-                        # Return OpenAI-compatible error response
-                        return {
-                            "error": {
-                                "message": error_detail,
-                                "type": "upstream_error",
-                                "code": "empty_response"
-                            }
-                        }
-                else:
-                    debug_print(f"✅ Response text preview: {response_text[:200]}...")
-                
-                cleaned_response = response_text.strip()
-                completion_tokens = estimate_tokens(cleaned_response)
-                request_usage["completion_tokens"] = completion_tokens
-                request_usage["total_tokens"] = prompt_tokens + completion_tokens
-                total_tokens = existing_tokens + request_usage["total_tokens"]
-                context_status_after = build_context_status(model_public_name, total_tokens)
-                
-                # Update session - Store message history with IDs
-                if not session:
-                    chat_sessions[api_key_str][conversation_id] = {
-                        "conversation_id": session_id,
-                        "model": model_public_name,
-                        "messages": [
-                            {"id": user_msg_id, "role": "user", "content": prompt},
-                            {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
-                        ],
-                        "context_status": context_status_after,
-                        "last_usage": request_usage.copy(),
-                        "updated_at": time.time()
                     }
-                    debug_print(f"💾 Saved new session for conversation {conversation_id}")
                 else:
-                    # Append new messages to history
-                    chat_sessions[api_key_str][conversation_id]["messages"].append(
-                        {"id": user_msg_id, "role": "user", "content": prompt}
-                    )
-                    chat_sessions[api_key_str][conversation_id]["messages"].append(
-                        {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
-                    )
-                    chat_sessions[api_key_str][conversation_id]["context_status"] = context_status_after
-                    chat_sessions[api_key_str][conversation_id]["last_usage"] = request_usage.copy()
-                    chat_sessions[api_key_str][conversation_id]["updated_at"] = time.time()
-                    debug_print(f"💾 Updated existing session for conversation {conversation_id}")
-
-                final_response = {
-                    "id": f"chatcmpl-{uuid.uuid4()}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
+                    error_detail = "Received empty response from upstream service. This could be due to: invalid authentication token, expired session, model unavailable, or rate limiting."
+                    debug_print(f"❌ {error_detail}")
+                    # Return OpenAI-compatible error response
+                    return {
+                        "error": {
+                            "message": error_detail,
+                            "type": "upstream_error",
+                            "code": "empty_response"
+                        }
+                    }
+            else:
+                debug_print(f"✅ Response text preview: {response_text[:200]}...")
+            
+            cleaned_response = response_text.strip()
+            completion_tokens = estimate_tokens(cleaned_response)
+            request_usage["completion_tokens"] = completion_tokens
+            request_usage["total_tokens"] = prompt_tokens + completion_tokens
+            total_tokens = existing_tokens + request_usage["total_tokens"]
+            context_status_after = build_context_status(model_public_name, total_tokens)
+            
+            # Update session - Store message history with IDs
+            if not session:
+                chat_sessions[api_key_str][conversation_id] = {
+                    "conversation_id": session_id,
                     "model": model_public_name,
-                    "conversation_id": conversation_id,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": cleaned_response,
-                        },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": request_usage.copy(),
-                    "context_status": context_status_after
+                    "messages": [
+                        {"id": user_msg_id, "role": "user", "content": prompt},
+                        {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
+                    ],
+                    "context_status": context_status_after,
+                    "last_usage": request_usage.copy(),
+                    "updated_at": time.time()
                 }
-                
-                debug_print(f"\n✅ REQUEST COMPLETED SUCCESSFULLY")
-                debug_print("="*80 + "\n")
-                
-                return final_response
+                debug_print(f"💾 Saved new session for conversation {conversation_id}")
+            else:
+                # Append new messages to history
+                chat_sessions[api_key_str][conversation_id]["messages"].append(
+                    {"id": user_msg_id, "role": "user", "content": prompt}
+                )
+                chat_sessions[api_key_str][conversation_id]["messages"].append(
+                    {"id": model_msg_id, "role": "assistant", "content": cleaned_response}
+                )
+                chat_sessions[api_key_str][conversation_id]["context_status"] = context_status_after
+                chat_sessions[api_key_str][conversation_id]["last_usage"] = request_usage.copy()
+                chat_sessions[api_key_str][conversation_id]["updated_at"] = time.time()
+                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
 
-            except httpx.HTTPStatusError as e:
-                error_detail = f"Upstream service error: {e.response.status_code}"
-                try:
-                    error_body = e.response.json()
-                    error_detail += f" - {error_body}"
-                except:
-                    error_detail += f" - {e.response.text[:200]}"
-                print(f"\n❌ HTTP STATUS ERROR")
-                print(f"📛 Error detail: {error_detail}")
-                print(f"📤 Request URL: {url}")
-                debug_print(f"📤 Request payload (truncated): {json.dumps(payload, indent=2)[:500]}")
-                debug_print(f"📥 Response text: {e.response.text[:500]}")
-                print("="*80 + "\n")
-                
-                # Return OpenAI-compatible error response
-                error_type = "rate_limit_error" if e.response.status_code == 429 else "upstream_error"
-                return {
-                    "error": {
-                        "message": error_detail,
-                        "type": error_type,
-                        "code": f"http_{e.response.status_code}"
-                    }
-                }
+            final_response = {
+                "id": f"chatcmpl-{uuid.uuid4()}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model_public_name,
+                "conversation_id": conversation_id,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": cleaned_response,
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": request_usage.copy(),
+                "context_status": context_status_after
+            }
             
-            except httpx.TimeoutException as e:
-                print(f"\n⏱️  TIMEOUT ERROR")
-                print(f"📛 Request timed out after 120 seconds")
-                print(f"📤 Request URL: {url}")
-                print("="*80 + "\n")
-                # Return OpenAI-compatible error response
-                return {
-                    "error": {
-                        "message": "Request to the upstream service timed out after 120 seconds",
-                        "type": "timeout_error",
-                        "code": "request_timeout"
-                    }
-                }
+            debug_print(f"\n✅ REQUEST COMPLETED SUCCESSFULLY")
+            debug_print("="*80 + "\n")
             
-            except Exception as e:
-                print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
-                print(f"📛 Error type: {type(e).__name__}")
-                print(f"📛 Error message: {str(e)}")
-                print(f"📤 Request URL: {url}")
-                print("="*80 + "\n")
-                # Return OpenAI-compatible error response
-                return {
-                    "error": {
-                        "message": f"Unexpected error: {str(e)}",
-                        "type": "internal_error",
-                        "code": type(e).__name__.lower()
-                    }
+            return final_response
+
+        except httpx.HTTPStatusError as e:
+            error_detail = f"Upstream service error: {e.response.status_code}"
+            try:
+                error_body = e.response.json()
+                error_detail += f" - {error_body}"
+            except:
+                error_detail += f" - {e.response.text[:200]}"
+            print(f"\n❌ HTTP STATUS ERROR")
+            print(f"📛 Error detail: {error_detail}")
+            print(f"📤 Request URL: {url}")
+            debug_print(f"📤 Request payload (truncated): {json.dumps(payload, indent=2)[:500]}")
+            debug_print(f"📥 Response text: {e.response.text[:500]}")
+            print("="*80 + "\n")
+            
+            # Mark proxy as failed if we have one
+            if hasattr(client, '_proxy_config') and client._proxy_config:
+                proxy_manager = get_proxy_manager()
+                if proxy_manager:
+                    await proxy_manager.mark_proxy_failed(client._proxy_config)
+            
+            # Return OpenAI-compatible error response
+            error_type = "rate_limit_error" if e.response.status_code == 429 else "upstream_error"
+            return {
+                "error": {
+                    "message": error_detail,
+                    "type": error_type,
+                    "code": f"http_{e.response.status_code}"
                 }
-                
+            }
+        
+        except httpx.TimeoutException as e:
+            print(f"\n⏱️  TIMEOUT ERROR")
+            print(f"📛 Request timed out after 120 seconds")
+            print(f"📤 Request URL: {url}")
+            print("="*80 + "\n")
+            
+            # Mark proxy as failed if we have one
+            if hasattr(client, '_proxy_config') and client._proxy_config:
+                proxy_manager = get_proxy_manager()
+                if proxy_manager:
+                    await proxy_manager.mark_proxy_failed(client._proxy_config)
+            
+            # Return OpenAI-compatible error response
+            return {
+                "error": {
+                    "message": "Request to the upstream service timed out after 120 seconds",
+                    "type": "timeout_error",
+                    "code": "request_timeout"
+                }
+            }
+        
+        except Exception as e:
+            print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
+            print(f"📛 Error type: {type(e).__name__}")
+            print(f"📛 Error message: {str(e)}")
+            print(f"📤 Request URL: {url}")
+            print("="*80 + "\n")
+            
+            # Mark proxy as failed if we have one
+            if hasattr(client, '_proxy_config') and client._proxy_config:
+                proxy_manager = get_proxy_manager()
+                if proxy_manager:
+                    await proxy_manager.mark_proxy_failed(client._proxy_config)
+            
+            # Return OpenAI-compatible error response
+            return {
+                "error": {
+                    "message": f"Unexpected error: {str(e)}",
+                    "type": "internal_error",
+                    "code": type(e).__name__.lower()
+                }
+            }
+        finally:
+            # Always close the client
+            await client.aclose()
+            
     except HTTPException:
         raise
     except Exception as e:

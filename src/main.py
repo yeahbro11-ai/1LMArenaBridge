@@ -17,6 +17,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, StreamingRespons
 from fastapi.security import APIKeyHeader
 
 import httpx
+from bypass import ReCaptchaV3Bypass
 
 # ============================================================
 # CONFIGURATION
@@ -26,12 +27,105 @@ DEBUG = False
 
 # Port to run the server on
 PORT = 8000
+
+# HTTP proxies to rotate through (add your proxy list here)
+# Format: "http://user:pass@ip:port" or "http://ip:port"
+HTTP_PROXIES = [
+    "http://65.111.3.29:3129",
+    "http://104.207.61.101:3129",
+    "http://209.50.165.93:3129",
+]
 # ============================================================
 
 def debug_print(*args, **kwargs):
     """Print debug messages only if DEBUG is True"""
     if DEBUG:
         print(*args, **kwargs)
+
+def get_recaptcha_token(anchor_url: str) -> Optional[str]:
+    """
+    Bypass reCAPTCHA v3 and get the token.
+
+    Args:
+        anchor_url: The reCAPTCHA anchor URL (can be found in network requests)
+                   Format: "https://www.google.com/recaptcha/api2/anchor?ar=1&k=..."
+
+    Returns:
+        The reCAPTCHA v3 token (gtk) if successful, None otherwise
+    """
+    try:
+        debug_print(f"🔐 Attempting reCAPTCHA bypass for URL: {anchor_url[:80]}...")
+
+        # Initialize the ReCaptchaV3Bypass class with the anchor URL
+        bypass = ReCaptchaV3Bypass(anchor_url)
+
+        # Call the bypass method to get the v3 token
+        gtk = bypass.bypass()
+
+        if gtk:
+            debug_print(f"✅ Successfully obtained reCAPTCHA token: {gtk[:20]}...")
+            return gtk
+        else:
+            debug_print("❌ Failed to obtain reCAPTCHA token")
+            return None
+
+    except Exception as e:
+        debug_print(f"❌ Error during reCAPTCHA bypass: {type(e).__name__}: {e}")
+        return None
+
+def get_cached_recaptcha_token(force_refresh: bool = False) -> Optional[str]:
+    """
+    Get a reCAPTCHA token with caching to avoid redundant generation.
+
+    Args:
+        force_refresh: If True, generate a new token even if cached one exists
+
+    Returns:
+        The reCAPTCHA token if successful, None otherwise
+    """
+    try:
+        config = get_config()
+        # Check both locations for backward compatibility
+        anchor_url = config.get("network", {}).get("recaptcha_anchor_url", "") or config.get("recaptcha_anchor_url", "")
+
+        # Debug logging
+        debug_print(f"📋 Config network section: {config.get('network', {})}")
+        debug_print(f"📋 Root recaptcha_anchor_url: {config.get('recaptcha_anchor_url', 'NOT_SET')}")
+        debug_print(f"📋 Network recaptcha_anchor_url: {config.get('network', {}).get('recaptcha_anchor_url', 'NOT_SET')}")
+        debug_print(f"📋 Final anchor_url: '{anchor_url[:50]}...'")
+
+        if not anchor_url:
+            debug_print("⚠️ No reCAPTCHA anchor URL configured")
+            return None
+
+        cache_key = anchor_url
+        current_time = time.time()
+
+        # Check if we have a valid cached token
+        if not force_refresh and cache_key in recaptcha_token_cache:
+            token_timestamp = recaptcha_token_timestamp.get(cache_key, 0)
+            if current_time - token_timestamp < RECAPTCHA_TOKEN_TTL:
+                debug_print(f"🔐 Using cached reCAPTCHA token (age: {current_time - token_timestamp:.0f}s)")
+                return recaptcha_token_cache[cache_key]
+            else:
+                debug_print(f"🔄 Cached reCAPTCHA token expired (age: {current_time - token_timestamp:.0f}s)")
+
+        # Generate new token
+        debug_print(f"🔐 Generating new reCAPTCHA token...")
+        token = get_recaptcha_token(anchor_url)
+
+        if token:
+            recaptcha_token_cache[cache_key] = token
+            recaptcha_token_timestamp[cache_key] = current_time
+            debug_print(f"✅ New reCAPTCHA token cached")
+        else:
+            debug_print(f"❌ Failed to generate reCAPTCHA token")
+
+        return token
+
+    except Exception as e:
+        debug_print(f"⚠️ reCAPTCHA token generation failed: {e}")
+        return None
 
 # Custom UUIDv7 implementation (using correct Unix epoch)
 def uuid7():
@@ -53,7 +147,7 @@ def uuid7():
 # Image upload helper functions
 async def upload_image_to_lmarena(image_data: bytes, mime_type: str, filename: str) -> Optional[tuple]:
     """
-    Upload an image to LMArena R2 storage and return the key and download URL.
+    Upload an image to LMArena R2 storage and return the key and download URL. 
     
     Args:
         image_data: Binary image data
@@ -185,7 +279,7 @@ async def upload_image_to_lmarena(image_data: bytes, mime_type: str, filename: s
 
 async def process_message_content(content, model_capabilities: dict) -> tuple[str, List[dict]]:
     """
-    Process message content, handle images if present and model supports them.
+    Process message content, handle images if present and model supports them. 
     
     Args:
         content: Message content (string or list of content parts)
@@ -209,7 +303,12 @@ async def process_message_content(content, model_capabilities: dict) -> tuple[st
         for part in content:
             if isinstance(part, dict):
                 if part.get('type') == 'text':
-                    text_parts.append(part.get('text', ''))
+                    # Only add text parts that have meaningful content (not empty or whitespace-only)
+                    text_value = part.get('text', '')
+                    if text_value and str(text_value).strip():
+                        text_parts.append(text_value)
+                    else:
+                        debug_print(f"⚠️  Skipping empty or whitespace-only text part: {repr(text_value)}")
                     
                 elif part.get('type') == 'image_url' and supports_images:
                     image_url = part.get('image_url', {})
@@ -287,6 +386,19 @@ async def process_message_content(content, model_capabilities: dict) -> tuple[st
         
         # Combine text parts
         text_content = '\n'.join(text_parts).strip()
+        
+        # Enhanced content validation: handle empty and whitespace-only content
+        if not text_content or not str(text_content).strip():
+            if attachments:
+                # If we have attachments but no meaningful text content, provide a default message
+                # to prevent "text content blocks must be non-empty" error
+                text_content = "[Image]"
+                debug_print(f"ℹ️  No meaningful text content provided with {len(attachments)} attachment(s), using default '[Image]' message")
+            else:
+                # No attachments and no meaningful content - this will be caught by the caller
+                text_content = ""
+                debug_print(f"⚠️  No text content and no attachments found in message")
+        
         return text_content, attachments
     
     # Fallback
@@ -308,6 +420,11 @@ dashboard_sessions = {}
 api_key_usage = defaultdict(list)
 # { "model_id": count }
 model_usage_stats = defaultdict(int)
+
+# ReCAPTCHA token tracking to avoid redundant generation
+recaptcha_token_cache: Dict[str, str] = {}  # {cache_key: token}
+recaptcha_token_timestamp: Dict[str, float] = {}  # {cache_key: generation_time}
+RECAPTCHA_TOKEN_TTL = 300  # 5 minutes TTL for reCAPTCHA tokens
 
 # --- Helper Functions ---
 
@@ -352,11 +469,20 @@ def save_models(models):
 
 def get_request_headers():
     config = get_config()
-    auth_token = config.get("auth_token", "").strip()
+    auth_token = config.get("auth_token", "")
+    if hasattr(auth_token, 'strip'):
+        auth_token = auth_token.strip()
+
     if not auth_token:
         raise HTTPException(status_code=500, detail="Arena auth token not set in dashboard.")
     
-    cf_clearance = config.get("cf_clearance", "").strip()
+    cf_clearance = config.get("cf_clearance", "")
+    if isinstance(cf_clearance, dict):
+        cf_clearance = cf_clearance.get("/", "")
+    
+    if hasattr(cf_clearance, 'strip'):
+        cf_clearance = cf_clearance.strip()
+
     return {
         "Content-Type": "application/json",
         "Cookie": f"cf_clearance={cf_clearance}; arena-auth-prod-v1={auth_token}",
@@ -375,39 +501,40 @@ async def get_current_session(request: Request):
 async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
     if not key.startswith("Bearer "):
         raise HTTPException(
-            status_code=401, 
+            status_code=401,
             detail="Invalid Authorization header. Expected 'Bearer YOUR_API_KEY'"
         )
-    
+
     # Remove "Bearer " prefix and strip whitespace
     api_key_str = key[7:].strip()
     config = get_config()
-    
+
     key_data = next((k for k in config["api_keys"] if k["key"] == api_key_str), None)
     if not key_data:
         raise HTTPException(status_code=401, detail="Invalid API Key.")
 
+    # TEMPORARILY DISABLED RATE LIMITING FOR TESTING
     # Rate Limiting
-    rate_limit = key_data.get("rpm", 60)
-    current_time = time.time()
-    
-    # Clean up old timestamps (older than 60 seconds)
-    api_key_usage[api_key_str] = [t for t in api_key_usage[api_key_str] if current_time - t < 60]
+    # rate_limit = key_data.get("rpm", 60)
+    # current_time = time.time()
+    #
+    # # Clean up old timestamps (older than 60 seconds)
+    # api_key_usage[api_key_str] = [t for t in api_key_usage[api_key_str] if current_time - t < 60]
+    #
+    # if len(api_key_usage[api_key_str]) >= rate_limit:
+    #     # Calculate seconds until oldest request expires (60 seconds window)
+    #     oldest_timestamp = min(api_key_usage[api_key_str])
+    #     retry_after = int(60 - (current_time - oldest_timestamp))
+    #     retry_after = max(1, retry_after)  # At least 1 second
+    #
+    #     raise HTTPException(
+    #         status_code=429,
+    #         detail="Rate limit exceeded. Please try again later.",
+    #         headers={"Retry-After": str(retry_after)}
+    #     )
+    #
+    # api_key_usage[api_key_str].append(current_time)
 
-    if len(api_key_usage[api_key_str]) >= rate_limit:
-        # Calculate seconds until oldest request expires (60 seconds window)
-        oldest_timestamp = min(api_key_usage[api_key_str])
-        retry_after = int(60 - (current_time - oldest_timestamp))
-        retry_after = max(1, retry_after)  # At least 1 second
-        
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded. Please try again later.",
-            headers={"Retry-After": str(retry_after)}
-        )
-        
-    api_key_usage[api_key_str].append(current_time)
-    
     return key_data
 
 # --- Core Logic ---
@@ -425,14 +552,14 @@ async def get_initial_data():
             try:
                 await page.wait_for_function(
                     "() => document.title.indexOf('Just a moment...') === -1", 
-                    timeout=45000
+                    timeout=90000
                 )
                 print("✅ Cloudflare challenge passed.")
             except Exception as e:
                 print(f"❌ Cloudflare challenge took too long or failed: {e}")
                 return
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(15)
 
             # Extract cf_clearance
             cookies = await page.context.cookies()
@@ -450,7 +577,7 @@ async def get_initial_data():
             print("Extracting models from page...")
             try:
                 body = await page.content()
-                match = re.search(r'{\\"initialModels\\":(\[.*?\]),\\"initialModel[A-Z]Id', body, re.DOTALL)
+                match = re.search(r'{\"initialModels\":(\[.*?\]),\"initialModel[A-Z]Id', body, re.DOTALL)
                 if match:
                     models_json = match.group(1).encode().decode('unicode_escape')
                     models = json.loads(models_json)
@@ -537,15 +664,15 @@ async def login_page(request: Request, error: Optional[str] = None):
                     margin-bottom: 10px;
                     font-size: 28px;
                 }}
-                .subtitle {{
+                .subtitle {{ 
                     color: #666;
                     margin-bottom: 30px;
                     font-size: 14px;
                 }}
-                .form-group {{
+                .form-group {{ 
                     margin-bottom: 20px;
                 }}
-                label {{
+                label {{ 
                     display: block;
                     margin-bottom: 8px;
                     color: #555;
@@ -636,24 +763,28 @@ async def dashboard(session: str = Depends(get_current_session)):
     config = get_config()
     models = get_models()
 
-    # Render API Keys
-    keys_html = ""
-    for key in config["api_keys"]:
-        created_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(key.get('created', 0)))
-        keys_html += f"""
-            <tr>
-                <td><strong>{key['name']}</strong></td>
-                <td><code class="api-key-code">{key['key']}</code></td>
-                <td><span class="badge">{key['rpm']} RPM</span></td>
-                <td><small>{created_date}</small></td>
-                <td>
-                    <form action='/delete-key' method='post' style='margin:0;' onsubmit='return confirm("Delete this API key?");'>
-                        <input type='hidden' name='key_id' value='{key['key']}'>
-                        <button type='submit' class='btn-delete'>Delete</button>
-                    </form>
-                </td>
-            </tr>
-        """
+    if config["api_keys"]:
+        keys_html = ""
+        for key in config["api_keys"]:
+            created_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(key.get('created', 0)))
+            keys_html += (
+                f"<tr>"
+                f"<td><strong>{key['name']}</strong></td>"
+                f"<td><code class=\"api-key-code\">{key['key']}</code></td>"
+                f"<td><span class=\"badge\">{key['rpm']} RPM</span></td>"
+                f"<td><small>{created_date}</small></td>"
+                f"<td>"
+                f"<form action='/delete-key' method='post' style='margin:0;' onsubmit='return confirm(\"Delete this API key?\");'>"
+                f"<input type='hidden' name='key_id' value='{key['key']}'>"
+                f"<button type='submit' class='btn-delete'>"
+                f"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><polyline points=\"3 6 5 6 21 6\"></polyline><path d=\"M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2\"></path><line x1=\"10\" y1=\"11\" x2=\"10\" y2=\"17\"></line><line x1=\"14\" y1=\"11\" x2=\"14\" y2=\"17\"></line></svg>"
+                f"</button>"
+                f"</form>"
+                f"</td>"
+                f"</tr>"
+            )
+    else:
+        keys_html = '<tr><td colspan="5" class="no-data">No API keys configured</td></tr>'
 
     # Render Models (limit to first 20 with text output)
     text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
@@ -675,8 +806,8 @@ async def dashboard(session: str = Depends(get_current_session)):
         models_html = '<div class="no-data">No models found. Token may be invalid or expired.</div>'
 
     # Render Stats
-    stats_html = ""
     if model_usage_stats:
+        stats_html = ""
         for model, count in sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
             stats_html += f"<tr><td>{model}</td><td><strong>{count}</strong></td></tr>"
     else:
@@ -692,6 +823,327 @@ async def dashboard(session: str = Depends(get_current_session)):
     # Get recent activity count (last 24 hours)
     recent_activity = sum(1 for timestamps in api_key_usage.values() for t in timestamps if time.time() - t < 86400)
 
+    DASHBOARD_CSS = """
+
+                :root {
+                    --bg-color: #1a1a2e;
+                    --sidebar-bg: #162447;
+                    --card-bg: #1f4068;
+                    --text-color: #e0e0e0;
+                    --header-color: #ffffff;
+                    --accent-color: #1b98e0;
+                    --accent-hover: #5cb8e4;
+                    --border-color: #3b3b58;
+                    --green-status: #28a745;
+                    --red-status: #dc3545;
+                }
+                @keyframes fadeIn {
+                    from { opacity: 0; transform: translateY(20px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                    background: var(--bg-color);
+                    color: var(--text-color);
+                    line-height: 1.6;
+                    display: flex;
+                }
+                .sidebar {
+                    width: 250px;
+                    background: var(--sidebar-bg);
+                    padding: 20px;
+                    height: 100vh;
+                    position: fixed;
+                    display: flex;
+                    flex-direction: column;
+                }
+                .sidebar h1 {
+                    font-size: 24px;
+                    font-weight: 600;
+                    color: var(--header-color);
+                    margin-bottom: 30px;
+                }
+                .sidebar .nav-link {
+                    color: var(--text-color);
+                    text-decoration: none;
+                    padding: 10px 15px;
+                    border-radius: 6px;
+                    margin-bottom: 10px;
+                    display: flex;
+                    align-items: center;
+                    transition: background 0.3s;
+                }
+                .sidebar .nav-link:hover, .sidebar .nav-link.active {
+                    background: var(--accent-color);
+                    color: var(--header-color);
+                }
+                .sidebar .nav-link svg {
+                    margin-right: 10px;
+                }
+                .logout-btn {
+                    background: var(--accent-color);
+                    color: white;
+                    padding: 8px 16px;
+                    border-radius: 6px;
+                    text-decoration: none;
+                    transition: background 0.3s;
+                    margin-top: auto;
+                    text-align: center;
+                }
+                .logout-btn:hover {
+                    background: var(--accent-hover);
+                }
+                .main-content {
+                    margin-left: 250px;
+                    padding: 30px;
+                    width: calc(100% - 250px);
+                }
+                .header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 30px;
+                }
+                .header h2 {
+                    font-size: 28px;
+                    color: var(--header-color);
+                }
+                .stats-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 20px;
+                    margin-bottom: 30px;
+                }
+                .stat-card {
+                    background: var(--card-bg);
+                    padding: 20px;
+                    border-radius: 8px;
+                    text-align: center;
+                    border-left: 4px solid var(--accent-color);
+                }
+                .stat-value {
+                    font-size: 32px;
+                    font-weight: bold;
+                    margin-bottom: 5px;
+                }
+                .stat-label {
+                    font-size: 14px;
+                    opacity: 0.8;
+                }
+                .section {
+                    background: var(--card-bg);
+                    border-radius: 10px;
+                    padding: 25px;
+                    margin-bottom: 25px;
+                }
+                .section-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 20px;
+                }
+                h3 {
+                    font-size: 20px;
+                    color: var(--header-color);
+                    font-weight: 600;
+                }
+                .status-badge {
+                    padding: 6px 12px;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+                .status-good { background: var(--green-status); color: white; }
+                .status-bad { background: var(--red-status); color: white; }
+                table {
+                    width: 100%;
+                    border-collapse: collapse;
+                }
+                th {
+                    padding: 12px;
+                    text-align: left;
+                    font-weight: 600;
+                    color: var(--header-color);
+                    font-size: 14px;
+                    border-bottom: 2px solid var(--border-color);
+                }
+                td {
+                    padding: 12px;
+                    border-bottom: 1px solid var(--border-color);
+                }
+                .form-group {
+                    margin-bottom: 15px;
+                }
+                label {
+                    display: block;
+                    margin-bottom: 6px;
+                    font-weight: 500;
+                    color: var(--text-color);
+                }
+                input[type="text"], input[type="number"], textarea {
+                    width: 100%;
+                    padding: 10px;
+                    border: 2px solid var(--border-color);
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-family: inherit;
+                    background: var(--bg-color);
+                    color: var(--text-color);
+                    transition: border-color 0.3s;
+                }
+                input:focus, textarea:focus {
+                    outline: none;
+                    border-color: var(--accent-color);
+                }
+                textarea {
+                    resize: vertical;
+                    font-family: 'Courier New', monospace;
+                    min-height: 100px;
+                }
+                button, .btn {
+                    padding: 10px 20px;
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: all 0.3s;
+                }
+                button[type="submit"] {
+                    background: var(--accent-color);
+                    color: white;
+                }
+                button[type="submit"]:hover {
+                    background: var(--accent-hover);
+                }
+                .btn-delete {
+                    background: transparent;
+                    color: var(--red-status);
+                    padding: 6px 12px;
+                    font-size: 13px;
+                    border: 1px solid var(--red-status);
+                }
+                .btn-delete:hover {
+                    background: var(--red-status);
+                    color: white;
+                }
+                .api-key-code {
+                    background: var(--bg-color);
+                    padding: 4px 8px;
+                    border-radius: 4px;
+                    font-family: 'Courier New', monospace;
+                    font-size: 12px;
+                }
+                .badge {
+                    background: var(--accent-color);
+                    color: white;
+                    padding: 4px 8px;
+                    border-radius: 4px;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                .model-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                    gap: 15px;
+                    margin-top: 15px;
+                }
+                .model-card {
+                    background: var(--bg-color);
+                    padding: 15px;
+                    border-radius: 8px;
+                    border-left: 4px solid var(--accent-color);
+                }
+                .model-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 8px;
+                }
+                .model-name {
+                    font-weight: 600;
+                    color: var(--header-color);
+                    font-size: 14px;
+                }
+                .model-rank {
+                    background: var(--accent-color);
+                    color: white;
+                    padding: 2px 8px;
+                    border-radius: 12px;
+                    font-size: 11px;
+                    font-weight: 600;
+                }
+                .model-org {
+                    color: var(--text-color);
+                    font-size: 12px;
+                    opacity: 0.8;
+                }
+                .no-data {
+                    text-align: center;
+                    color: var(--text-color);
+                    padding: 20px;
+                    font-style: italic;
+                    opacity: 0.7;
+                }
+                .form-row {
+                    display: grid;
+                    grid-template-columns: 2fr 1fr auto;
+                    gap: 10px;
+                    align-items: end;
+                }
+                .chat-container {
+                    display: flex;
+                    flex-direction: column;
+                    height: 500px;
+                }
+                .chat-log {
+                    flex-grow: 1;
+                    overflow-y: auto;
+                    border: 1px solid var(--border-color);
+                    border-radius: 6px;
+                    padding: 15px;
+                    margin-bottom: 15px;
+                    background: var(--bg-color);
+                }
+                .chat-message {
+                    margin-bottom: 15px;
+                }
+                .chat-message-user strong {
+                    color: var(--accent-color);
+                }
+                .chat-message-assistant strong {
+                    color: var(--green-status);
+                }
+                .chat-input-area {
+                    display: flex;
+                    flex-direction: column;
+                }
+                @media (max-width: 768px) {
+                    .sidebar {
+                        width: 100%;
+                        height: auto;
+                        position: relative;
+                        flex-direction: row;
+                        justify-content: space-between;
+                        align-items: center;
+                    }
+                    .sidebar h1 {
+                        margin-bottom: 0;
+                    }
+                    .main-content {
+                        margin-left: 0;
+                        width: 100%;
+                    }
+                    .form-row {
+                        grid-template-columns: 1fr;
+                    }
+                    .model-grid {
+                        grid-template-columns: 1fr;
+                    }
+                }
+    """
+
     return f"""
         <!DOCTYPE html>
         <html>
@@ -700,289 +1152,40 @@ async def dashboard(session: str = Depends(get_current_session)):
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
             <style>
-                @keyframes fadeIn {{
-                    from {{ opacity: 0; transform: translateY(20px); }}
-                    to {{ opacity: 1; transform: translateY(0); }}
-                }}
-                @keyframes slideIn {{
-                    from {{ opacity: 0; transform: translateX(-20px); }}
-                    to {{ opacity: 1; transform: translateX(0); }}
-                }}
-                @keyframes pulse {{
-                    0%, 100% {{ transform: scale(1); }}
-                    50% {{ transform: scale(1.05); }}
-                }}
-                @keyframes shimmer {{
-                    0% {{ background-position: -1000px 0; }}
-                    100% {{ background-position: 1000px 0; }}
-                }}
-                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-                    background: #f5f7fa;
-                    color: #333;
-                    line-height: 1.6;
-                }}
-                .header {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    padding: 20px 0;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                }}
-                .header-content {{
-                    max-width: 1200px;
-                    margin: 0 auto;
-                    padding: 0 20px;
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                }}
-                h1 {{
-                    font-size: 24px;
-                    font-weight: 600;
-                }}
-                .logout-btn {{
-                    background: rgba(255,255,255,0.2);
-                    color: white;
-                    padding: 8px 16px;
-                    border-radius: 6px;
-                    text-decoration: none;
-                    transition: background 0.3s;
-                }}
-                .logout-btn:hover {{
-                    background: rgba(255,255,255,0.3);
-                }}
-                .container {{
-                    max-width: 1200px;
-                    margin: 30px auto;
-                    padding: 0 20px;
-                }}
-                .section {{
-                    background: white;
-                    border-radius: 10px;
-                    padding: 25px;
-                    margin-bottom: 25px;
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-                }}
-                .section-header {{
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 20px;
-                    padding-bottom: 15px;
-                    border-bottom: 2px solid #f0f0f0;
-                }}
-                h2 {{
-                    font-size: 20px;
-                    color: #333;
-                    font-weight: 600;
-                }}
-                .status-badge {{
-                    padding: 6px 12px;
-                    border-radius: 6px;
-                    font-size: 13px;
-                    font-weight: 600;
-                }}
-                .status-good {{ background: #d4edda; color: #155724; }}
-                .status-bad {{ background: #f8d7da; color: #721c24; }}
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                }}
-                th {{
-                    background: #f8f9fa;
-                    padding: 12px;
-                    text-align: left;
-                    font-weight: 600;
-                    color: #555;
-                    font-size: 14px;
-                    border-bottom: 2px solid #e9ecef;
-                }}
-                td {{
-                    padding: 12px;
-                    border-bottom: 1px solid #f0f0f0;
-                }}
-                tr:hover {{
-                    background: #f8f9fa;
-                }}
-                .form-group {{
-                    margin-bottom: 15px;
-                }}
-                label {{
-                    display: block;
-                    margin-bottom: 6px;
-                    font-weight: 500;
-                    color: #555;
-                }}
-                input[type="text"], input[type="number"], textarea {{
-                    width: 100%;
-                    padding: 10px;
-                    border: 2px solid #e1e8ed;
-                    border-radius: 6px;
-                    font-size: 14px;
-                    font-family: inherit;
-                    transition: border-color 0.3s;
-                }}
-                input:focus, textarea:focus {{
-                    outline: none;
-                    border-color: #667eea;
-                }}
-                textarea {{
-                    resize: vertical;
-                    font-family: 'Courier New', monospace;
-                    min-height: 100px;
-                }}
-                button, .btn {{
-                    padding: 10px 20px;
-                    border: none;
-                    border-radius: 6px;
-                    font-size: 14px;
-                    font-weight: 600;
-                    cursor: pointer;
-                    transition: all 0.3s;
-                }}
-                button[type="submit"]:not(.btn-delete) {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                }}
-                button[type="submit"]:not(.btn-delete):hover {{
-                    transform: translateY(-2px);
-                    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
-                }}
-                .btn-delete {{
-                    background: #dc3545;
-                    color: white;
-                    padding: 6px 12px;
-                    font-size: 13px;
-                }}
-                .btn-delete:hover {{
-                    background: #c82333;
-                }}
-                .api-key-code {{
-                    background: #f8f9fa;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    font-family: 'Courier New', monospace;
-                    font-size: 12px;
-                    color: #495057;
-                }}
-                .badge {{
-                    background: #e7f3ff;
-                    color: #0066cc;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    font-size: 12px;
-                    font-weight: 600;
-                }}
-                .model-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-                    gap: 15px;
-                    margin-top: 15px;
-                }}
-                .model-card {{
-                    background: #f8f9fa;
-                    padding: 15px;
-                    border-radius: 8px;
-                    border-left: 4px solid #667eea;
-                }}
-                .model-header {{
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 8px;
-                }}
-                .model-name {{
-                    font-weight: 600;
-                    color: #333;
-                    font-size: 14px;
-                }}
-                .model-rank {{
-                    background: #667eea;
-                    color: white;
-                    padding: 2px 8px;
-                    border-radius: 12px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }}
-                .model-org {{
-                    color: #666;
-                    font-size: 12px;
-                }}
-                .no-data {{
-                    text-align: center;
-                    color: #999;
-                    padding: 20px;
-                    font-style: italic;
-                }}
-                .stats-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                    gap: 20px;
-                    margin-bottom: 20px;
-                }}
-                .stat-card {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    text-align: center;
-                    animation: fadeIn 0.6s ease-out;
-                    transition: transform 0.3s;
-                }}
-                .stat-card:hover {{
-                    transform: translateY(-5px);
-                    box-shadow: 0 8px 16px rgba(102, 126, 234, 0.4);
-                }}
-                .section {{
-                    animation: slideIn 0.5s ease-out;
-                }}
-                .section:nth-child(2) {{ animation-delay: 0.1s; }}
-                .section:nth-child(3) {{ animation-delay: 0.2s; }}
-                .section:nth-child(4) {{ animation-delay: 0.3s; }}
-                .model-card {{
-                    animation: fadeIn 0.4s ease-out;
-                    transition: transform 0.2s, box-shadow 0.2s;
-                }}
-                .model-card:hover {{
-                    transform: translateY(-3px);
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-                }}
-                .stat-value {{
-                    font-size: 32px;
-                    font-weight: bold;
-                    margin-bottom: 5px;
-                }}
-                .stat-label {{
-                    font-size: 14px;
-                    opacity: 0.9;
-                }}
-                .form-row {{
-                    display: grid;
-                    grid-template-columns: 2fr 1fr auto;
-                    gap: 10px;
-                    align-items: end;
-                }}
-                @media (max-width: 768px) {{
-                    .form-row {{
-                        grid-template-columns: 1fr;
-                    }}
-                    .model-grid {{
-                        grid-template-columns: 1fr;
-                    }}
-                }}
+                {DASHBOARD_CSS}
             </style>
         </head>
         <body>
-            <div class="header">
-                <div class="header-content">
-                    <h1>🚀 LMArena Bridge Dashboard</h1>
-                    <a href="/logout" class="logout-btn">Logout</a>
-                </div>
+            <div class="sidebar">
+                <h1>🚀 LMArena Bridge</h1>
+                <a href="#auth" class="nav-link active">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+                    <span>Authentication</span>
+                </a>
+                <a href="#keys" class="nav-link">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg>
+                    <span>API Keys</span>
+                </a>
+                <a href="#stats" class="nav-link">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"></path><path d="M18.7 8a2.3 2.3 0 0 0-3.4 0l-4.6 4.6a2.3 2.3 0 0 0 0 3.4l4.6 4.6a2.3 2.3 0 0 0 3.4 0l4.6-4.6a2.3 2.3 0 0 0 0-3.4z"></path></svg>
+                    <span>Usage Statistics</span>
+                </a>
+                <a href="#models" class="nav-link">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"></path><path d="M8 4H4v4"></path><path d="M12 20v-4h4"></path><path d="M20 20h-4v-4"></path><path d="M4 12H2"></path><path d="M12 2h2"></path><path d="M12 22h2"></path><path d="M22 12h-2"></path></svg>
+                    <span>Available Models</span>
+                </a>
+                <a href="#test-chat" class="nav-link">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                    <span>Test Chat</span>
+                </a>
+                <a href="/logout" class="logout-btn">Logout</a>
             </div>
 
-            <div class="container">
-                <!-- Stats Overview -->
+            <div class="main-content">
+                <div class="header">
+                    <h2>Dashboard</h2>
+                </div>
+                
                 <div class="stats-grid">
                     <div class="stat-card">
                         <div class="stat-value">{len(config['api_keys'])}</div>
@@ -998,10 +1201,9 @@ async def dashboard(session: str = Depends(get_current_session)):
                     </div>
                 </div>
 
-                <!-- Arena Auth Token -->
-                <div class="section">
+                <div id="auth" class="section">
                     <div class="section-header">
-                        <h2>🔐 Arena Authentication</h2>
+                        <h3>🔐 Arena Authentication</h3>
                         <span class="status-badge {token_class}">{token_status}</span>
                     </div>
                     <form action="/update-auth-token" method="post">
@@ -1013,26 +1215,23 @@ async def dashboard(session: str = Depends(get_current_session)):
                     </form>
                 </div>
 
-                <!-- Cloudflare Clearance -->
                 <div class="section">
                     <div class="section-header">
-                        <h2>☁️ Cloudflare Clearance</h2>
+                        <h3>☁️ Cloudflare Clearance</h3>
                         <span class="status-badge {cf_class}">{cf_status}</span>
                     </div>
-                    <p style="color: #666; margin-bottom: 15px;">This is automatically fetched on startup. If API requests fail with 404 errors, the token may have expired.</p>
-                    <code style="background: #f8f9fa; padding: 10px; display: block; border-radius: 6px; word-break: break-all; margin-bottom: 15px;">
+                    <p style="opacity: 0.8; margin-bottom: 15px;">This is automatically fetched on startup. If API requests fail, the token may have expired.</p>
+                    <code style="background: var(--bg-color); padding: 10px; display: block; border-radius: 6px; word-break: break-all; margin-bottom: 15px;">
                         {config.get("cf_clearance", "Not set")}
                     </code>
                     <form action="/refresh-tokens" method="post" style="margin-top: 15px;">
-                        <button type="submit" style="background: #28a745;">🔄 Refresh Tokens &amp; Models</button>
+                        <button type="submit" style="background: #28a745;">🔄 Refresh Tokens & Models</button>
                     </form>
-                    <p style="color: #999; font-size: 13px; margin-top: 10px;"><em>Note: This will fetch a fresh cf_clearance token and update the model list.</em></p>
                 </div>
 
-                <!-- API Keys -->
-                <div class="section">
+                <div id="keys" class="section">
                     <div class="section-header">
-                        <h2>🔑 API Keys</h2>
+                        <h3>🔑 API Keys</h3>
                     </div>
                     <table>
                         <thead>
@@ -1045,11 +1244,11 @@ async def dashboard(session: str = Depends(get_current_session)):
                             </tr>
                         </thead>
                         <tbody>
-                            {keys_html if keys_html else '<tr><td colspan="5" class="no-data">No API keys configured</td></tr>'}
+                            {keys_html}
                         </tbody>
                     </table>
                     
-                    <h3 style="margin-top: 30px; margin-bottom: 15px; font-size: 18px;">Create New API Key</h3>
+                    <h4 style="margin-top: 30px; margin-bottom: 15px; font-size: 18px;">Create New API Key</h4>
                     <form action="/create-key" method="post">
                         <div class="form-row">
                             <div class="form-group">
@@ -1068,18 +1267,17 @@ async def dashboard(session: str = Depends(get_current_session)):
                     </form>
                 </div>
 
-                <!-- Usage Statistics -->
-                <div class="section">
+                <div id="stats" class="section">
                     <div class="section-header">
-                        <h2>📊 Usage Statistics</h2>
+                        <h3>📊 Usage Statistics</h3>
                     </div>
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 30px;">
                         <div>
-                            <h3 style="text-align: center; margin-bottom: 15px; font-size: 16px; color: #666;">Model Usage Distribution</h3>
+                            <h4 style="text-align: center; margin-bottom: 15px; font-size: 16px;">Model Usage Distribution</h4>
                             <canvas id="modelPieChart" style="max-height: 300px;"></canvas>
                         </div>
                         <div>
-                            <h3 style="text-align: center; margin-bottom: 15px; font-size: 16px; color: #666;">Request Count by Model</h3>
+                            <h4 style="text-align: center; margin-bottom: 15px; font-size: 16px;">Request Count by Model</h4>
                             <canvas id="modelBarChart" style="max-height: 300px;"></canvas>
                         </div>
                     </div>
@@ -1096,14 +1294,35 @@ async def dashboard(session: str = Depends(get_current_session)):
                     </table>
                 </div>
 
-                <!-- Available Models -->
-                <div class="section">
+                <div id="models" class="section">
                     <div class="section-header">
-                        <h2>🤖 Available Models</h2>
+                        <h3>🤖 Available Models</h3>
                     </div>
-                    <p style="color: #666; margin-bottom: 15px;">Showing top 20 text-based models (Rank 1 = Best)</p>
+                    <p style="opacity: 0.8; margin-bottom: 15px;">Showing top 20 text-based models (Rank 1 = Best)</p>
                     <div class="model-grid">
                         {models_html}
+                    </div>
+                </div>
+
+                <div id="test-chat" class="section">
+                    <div class="section-header">
+                        <h3>🧪 Test Chat</h3>
+                    </div>
+                    <div class="chat-container">
+                        <div id="chat-log" class="chat-log"></div>
+                        <div class="chat-input-area">
+                            <div class="form-group">
+                                <label for="chat-model-selector">Model</label>
+                                <select id="chat-model-selector" class="chat-model-selector">
+                                    {''.join([f'<option value="{m["publicName"]}">{m["publicName"]}</option>' for m in text_models])}
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="chat-input">Message</label>
+                                <textarea id="chat-input" placeholder="Type your message..."></textarea>
+                                <button id="chat-send-btn">Send</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1116,11 +1335,14 @@ async def dashboard(session: str = Depends(get_current_session)):
                 
                 // Generate colors for charts
                 const colors = [
-                    '#667eea', '#764ba2', '#f093fb', '#4facfe',
-                    '#43e97b', '#fa709a', '#fee140', '#30cfd0',
-                    '#a8edea', '#fed6e3'
+                    '#1b98e0', '#5cb8e4', '#28a745', '#3b3b58',
+                    '#f093fb', '#4facfe', '#43e97b', '#fa709a',
+                    '#fee140', '#30cfd0'
                 ];
                 
+                Chart.defaults.color = '#e0e0e0';
+                Chart.defaults.borderColor = '#3b3b58';
+
                 // Pie Chart
                 if (modelNames.length > 0) {{
                     const pieCtx = document.getElementById('modelPieChart').getContext('2d');
@@ -1132,7 +1354,7 @@ async def dashboard(session: str = Depends(get_current_session)):
                                 data: modelCounts,
                                 backgroundColor: colors,
                                 borderWidth: 2,
-                                borderColor: '#fff'
+                                borderColor: '#1a1a2e'
                             }}]
                         }},
                         options: {{
@@ -1172,8 +1394,8 @@ async def dashboard(session: str = Depends(get_current_session)):
                             datasets: [{{
                                 label: 'Requests',
                                 data: modelCounts,
-                                backgroundColor: colors[0],
-                                borderColor: colors[1],
+                                backgroundColor: '#1b98e0',
+                                borderColor: '#5cb8e4',
                                 borderWidth: 1
                             }}]
                         }},
@@ -1183,38 +1405,130 @@ async def dashboard(session: str = Depends(get_current_session)):
                             plugins: {{
                                 legend: {{
                                     display: false
-                                }},
-                                tooltip: {{
-                                    callbacks: {{
-                                        label: function(context) {{
-                                            return 'Requests: ' + context.parsed.y;
-                                        }}
-                                    }}
                                 }}
                             }},
                             scales: {{
                                 y: {{
                                     beginAtZero: true,
-                                    ticks: {{
-                                        stepSize: 1
+                                    grid: {{
+                                        color: '#3b3b58'
                                     }}
                                 }},
                                 x: {{
-                                    ticks: {{
-                                        font: {{
-                                            size: 10
-                                        }},
-                                        maxRotation: 45,
-                                        minRotation: 45
+                                    grid: {{
+                                        display: false
                                     }}
                                 }}
                             }}
                         }}
                     }});
                 }} else {{
-                    // Show "no data" message
-                    document.getElementById('modelPieChart').parentElement.innerHTML = '<p style="text-align: center; color: #999; padding: 50px;">No usage data yet</p>';
-                    document.getElementById('modelBarChart').parentElement.innerHTML = '<p style="text-align: center; color: #999; padding: 50px;">No usage data yet</p>';
+                    document.getElementById('modelPieChart').parentElement.innerHTML = '<p class="no-data">No usage data yet</p>';
+                    document.getElementById('modelBarChart').parentElement.innerHTML = '<p class="no-data">No usage data yet</p>';
+                }}
+
+                // Smooth scrolling for nav links
+                document.querySelectorAll('.nav-link').forEach(anchor => {{
+                    anchor.addEventListener('click', function (e) {{
+                        e.preventDefault();
+                        document.querySelector(this.getAttribute('href')).scrollIntoView({{
+                            behavior: 'smooth'
+                        }});
+                    }});
+                }});
+
+                // Test Chat
+                const chatLog = document.getElementById('chat-log');
+                const chatInput = document.getElementById('chat-input');
+                const chatSendBtn = document.getElementById('chat-send-btn');
+                const chatModelSelector = document.getElementById('chat-model-selector');
+                let conversationHistory = [];
+
+                chatSendBtn.addEventListener('click', sendMessage);
+                chatInput.addEventListener('keypress', (e) => {{ 
+                    if (e.key === 'Enter' && !e.shiftKey) {{
+                        e.preventDefault();
+                        sendMessage();
+                    }}
+                }});
+
+                function addMessageToLog(role, content) {{
+                    const messageElem = document.createElement('div');
+                    messageElem.classList.add('chat-message', `chat-message-${{role}}`);
+                    const roleElem = document.createElement('strong');
+                    roleElem.textContent = role;
+                    messageElem.appendChild(roleElem);
+                    const contentElem = document.createElement('div');
+                    contentElem.textContent = content;
+                    messageElem.appendChild(contentElem);
+                    chatLog.appendChild(messageElem);
+                    chatLog.scrollTop = chatLog.scrollHeight;
+                    return contentElem;
+                }}
+
+                async function sendMessage() {{
+                    const message = chatInput.value.trim();
+                    if (!message) return;
+
+                    const model = chatModelSelector.value;
+                    addMessageToLog('user', message);
+                    chatInput.value = '';
+
+                    conversationHistory.push({{ role: 'user', content: message }});
+
+                    const responseElem = addMessageToLog('assistant', '...');
+
+                    try {{
+                        const response = await fetch('/api/v1/dashboard/chat', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json' }},
+                            body: JSON.stringify({{
+                                model: model,
+                                messages: conversationHistory,
+                                stream: true
+                            }})
+                        }});
+
+                        if (!response.body) {{
+                            responseElem.textContent = 'Error: Streaming not supported by browser.';
+                            return;
+                        }}
+
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        let assistantMessage = '';
+                        responseElem.textContent = '';
+
+                        while (true) {{
+                            const {{ done, value }} = await reader.read();
+                            if (done) break;
+
+                            const chunk = decoder.decode(value);
+                            const lines = chunk.split('\n\n');
+
+                            for (const line of lines) {{
+                                if (line.startsWith('data: ')) {{
+                                    const data = line.substring(6);
+                                    if (data.startsWith('[DONE]')) {{
+                                        break;
+                                    }}
+                                    try {{
+                                        const json = JSON.parse(data);
+                                        if (json.choices && json.choices[0].delta.content) {{
+                                            assistantMessage += json.choices[0].delta.content;
+                                            responseElem.textContent = assistantMessage;
+                                        }}
+                                    }} catch (e) {{
+                                        console.error('Error parsing stream data:', e);
+                                    }}
+                                }}
+                            }}
+                        }}
+                        conversationHistory.push({{ role: 'assistant', content: assistantMessage }});
+
+                    }} catch (e) {{
+                        responseElem.textContent = 'Error: ' + e.message;
+                    }}
                 }}
             </script>
         </body>
@@ -1263,6 +1577,41 @@ async def refresh_tokens(session: str = Depends(get_current_session)):
 
 # --- OpenAI Compatible API Endpoints ---
 
+@app.post("/api/v1/dashboard/chat")
+async def dashboard_chat(request: Request, session: str = Depends(get_current_session)):
+    if not session:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Use the first API key from the config for dashboard chat
+    config = get_config()
+    if not config["api_keys"]:
+        raise HTTPException(status_code=400, detail="No API keys configured to use for dashboard chat.")
+    
+    api_key_data = config["api_keys"][0]
+    
+    # We will manually create a request object with the required headers and body
+    # and then call the api_chat_completions function. 
+    
+    # Create a dummy request that looks like it came from a real client
+    new_request = Request(scope=request.scope, receive=request.receive)
+    
+    # We need to set the authorization header for the rate limiter
+    new_request.headers.__dict__["_list"].append(
+        (b'authorization', f"Bearer {api_key_data['key']}".encode('latin-1'))
+    )
+
+    async def chat_body():
+        return await request.json()
+
+    new_request.json = chat_body
+
+    return await api_chat_completions(new_request, api_key_data)
+
 @app.get("/api/v1/health")
 async def health_check():
     """Health check endpoint for monitoring"""
@@ -1297,11 +1646,9 @@ async def health_check():
 @app.get("/api/v1/models")
 async def list_models(api_key: dict = Depends(rate_limit_api_key)):
     models = get_models()
-    # Filter for models with text OR search output capability and an organization (exclude stealth models)
-    # Include chat, search, and web dev models
-    valid_models = [m for m in models 
-                   if (m.get('capabilities', {}).get('outputCapabilities', {}).get('text')
-                       or m.get('capabilities', {}).get('outputCapabilities', {}).get('search'))
+    # Filter for text-based models with an organization (exclude stealth models)
+    text_models = [m for m in models 
+                   if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')
                    and m.get('organization')]
     
     return {
@@ -1312,7 +1659,7 @@ async def list_models(api_key: dict = Depends(rate_limit_api_key)):
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": model.get("organization", "lmarena")
-            } for model in valid_models if model.get("publicName")
+            } for model in text_models if model.get("publicName")
         ]
     }
 
@@ -1321,7 +1668,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
     debug_print("\n" + "="*80)
     debug_print("🔵 NEW API REQUEST RECEIVED")
     debug_print("="*80)
-    
+
+    # Initialize session variable to avoid UnboundLocalError
+    session = None
+
     try:
         # Parse request body with error handling
         try:
@@ -1339,10 +1689,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         model_public_name = body.get("model")
         messages = body.get("messages", [])
         stream = body.get("stream", False)
-        
+        conversation_id = body.get("conversation_id")  # Optional parameter for server-side context
+
         debug_print(f"🌊 Stream mode: {stream}")
         debug_print(f"🤖 Requested model: {model_public_name}")
         debug_print(f"💬 Number of messages: {len(messages)}")
+        if conversation_id:
+            debug_print(f"💭 Provided conversation_id: {conversation_id}")
         
         if not model_public_name:
             debug_print("❌ Missing 'model' in request")
@@ -1399,16 +1752,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         
         debug_print(f"✅ Found model ID: {model_id}")
         debug_print(f"🔧 Model capabilities: {model_capabilities}")
-        
-        # Determine modality based on model capabilities
-        # Priority: image > search > chat
-        if model_capabilities.get('outputCapabilities', {}).get('image'):
-            modality = "image"
-        elif model_capabilities.get('outputCapabilities', {}).get('search'):
-            modality = "search"
-        else:
-            modality = "chat"
-        debug_print(f"🔍 Model modality: {modality}")
 
         # Log usage
         try:
@@ -1421,112 +1764,136 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             # Don't fail the request if usage logging fails
             debug_print(f"⚠️  Failed to log usage stats: {e}")
 
-        # Extract system prompt if present and prepend to first user message
+        # Store the last user message content for session storage
+        last_user_message_content = None
+        user_messages = [m for m in messages if m.get("role") == "user"]
+        if user_messages:
+            last_user_message_content = user_messages[-1].get("content", "")
+
+        # Extract system prompt if present
         system_prompt = ""
         system_messages = [m for m in messages if m.get("role") == "system"]
         if system_messages:
-            system_prompt = "\n\n".join([m.get("content", "") for m in system_messages])
-            debug_print(f"📋 System prompt found: {system_prompt[:100]}..." if len(system_prompt) > 100 else f"📋 System prompt: {system_prompt}")
-        
-        # Process last message content (may include images)
-        try:
-            last_message_content = messages[-1].get("content", "")
-            prompt, experimental_attachments = await process_message_content(last_message_content, model_capabilities)
-            
-            # If there's a system prompt and this is the first user message, prepend it
+            # Filter out empty or whitespace-only system messages
+            valid_system_messages = [
+                m.get("content", "") for m in system_messages 
+                if m.get("content", "") and str(m.get("content", "")).strip()
+            ]
+            if valid_system_messages:
+                system_prompt = "\n\n".join(valid_system_messages)
+                debug_print(f"📋 System prompt found: {system_prompt[:100]}..." if len(system_prompt) > 100 else f"📋 System prompt: {system_prompt}")
+
+        # Build conversation history string
+        experimental_attachments = []
+
+        if session:
+            # For existing sessions, LMArena maintains internal context - just send the new message
+            debug_print(f"📚 Existing session - sending only new message to LMArena")
+
+            # Process the new user message
+            user_messages = [m for m in messages if m.get("role") == "user"]
+            if user_messages:
+                last_message = user_messages[-1]
+                prompt_text, attachments = await process_message_content(last_message.get("content", ""), model_capabilities)
+                if attachments:
+                    experimental_attachments = attachments
+                prompt = prompt_text
+            else:
+                prompt = ""
+        else:
+            # For new conversations, send full context
+            debug_print(f"🆕 New conversation - sending full message history to LMArena")
+            conversation_parts = []
             if system_prompt:
-                prompt = f"{system_prompt}\n\n{prompt}"
-                debug_print(f"✅ System prompt prepended to user message")
-        except Exception as e:
-            debug_print(f"❌ Failed to process message content: {e}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to process message content: {str(e)}"
-            )
+                conversation_parts.append(system_prompt)
+
+            for i, message in enumerate(messages):
+                role = message.get("role")
+                if role == "system":
+                    continue
+
+                content = message.get("content", "")
+
+                # Special handling for the last message which might contain images
+                if i == len(messages) - 1:
+                    prompt_text, attachments = await process_message_content(content, model_capabilities)
+                    if attachments:
+                        experimental_attachments = attachments
+                    if prompt_text:
+                        conversation_parts.append(f"{role.capitalize()}: {prompt_text}")
+                else:
+                    # For previous messages, extract text content
+                    if isinstance(content, list):
+                        text_parts = [part.get('text', '') for part in content if part.get('type') == 'text']
+                        text_content = "\n".join(text_parts).strip()
+                    else:
+                        text_content = str(content).strip()
+
+                    if text_content:
+                        conversation_parts.append(f"{role.capitalize()}: {text_content}")
+
+            prompt = "\n\n".join(conversation_parts)
         
-        # Validate prompt
-        if not prompt:
-            # If no text but has attachments, that's okay for vision models
-            if not experimental_attachments:
-                debug_print("❌ Last message has no content")
-                raise HTTPException(status_code=400, detail="Last message must have content.")
+        # Validate prompt - check for empty or whitespace-only content
+        prompt_stripped = str(prompt).strip()
+        has_attachments = isinstance(experimental_attachments, (list, tuple)) and len(experimental_attachments) > 0
+        
+        if not prompt_stripped:
+            # If no text but has attachments, use default message
+            if has_attachments:
+                prompt = "[Image]"
+                debug_print("ℹ️  Empty prompt with attachments, using default '[Image]' message")
+            else:
+                debug_print("❌ Last message has no content and no attachments")
+                raise HTTPException(status_code=400, detail="Last message must have content or attachments.")
         
         # Log prompt length for debugging character limit issues
         debug_print(f"📝 User prompt length: {len(prompt)} characters")
         debug_print(f"🖼️  Attachments: {len(experimental_attachments)} images")
         debug_print(f"📝 User prompt preview: {prompt[:100]}..." if len(prompt) > 100 else f"📝 User prompt: {prompt}")
-        
+
         # Check for reasonable character limit (LMArena appears to have limits)
-        # Typical limit seems to be around 32K-64K characters based on testing
-        MAX_PROMPT_LENGTH = 113567  # User hardcoded limit
+        # For existing sessions, limit is much lower since context is maintained by LMArena
+        MAX_PROMPT_LENGTH = 100000 if session else 500000  # Lower limit for follow-up messages
         if len(prompt) > MAX_PROMPT_LENGTH:
-            error_msg = f"Prompt too long ({len(prompt)} characters). LMArena has a character limit of approximately {MAX_PROMPT_LENGTH} characters. Please reduce the message size."
+            error_msg = f"Prompt too long ({len(prompt)} characters). Maximum allowed: {MAX_PROMPT_LENGTH} characters."
             debug_print(f"❌ {error_msg}")
             raise HTTPException(status_code=400, detail=error_msg)
         
         # Use API key + conversation tracking
         api_key_str = api_key["key"]
-        
-        # Generate conversation ID from context (API key + model + first user message)
-        # This allows automatic session continuation without client modifications
-        import hashlib
-        first_user_message = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
-        if isinstance(first_user_message, list):
-            # Handle array content format
-            first_user_message = str(first_user_message)
-        conversation_key = f"{api_key_str}_{model_public_name}_{first_user_message[:100]}"
-        conversation_id = hashlib.sha256(conversation_key.encode()).hexdigest()[:16]
-        
+
+        # Check if conversation_id was provided in request
+        if not conversation_id:
+            # For clients that don't provide conversation_id (like Roo),
+            # use a consistent conversation_id per API key + model combination
+            # This allows maintaining context across requests
+            import hashlib
+            conversation_key = f"{api_key_str}_{model_public_name}"
+            conversation_id = hashlib.sha256(conversation_key.encode()).hexdigest()[:16]
+            debug_print(f"🔑 Using consistent conversation_id {conversation_id} for {api_key_str} + {model_public_name}")
+
         debug_print(f"🔑 API Key: {api_key_str[:20]}...")
-        debug_print(f"💭 Auto-generated Conversation ID: {conversation_id}")
-        debug_print(f"🔑 Conversation key: {conversation_key[:100]}...")
-        
+        debug_print(f"💭 Conversation ID: {conversation_id}")
+
         headers = get_request_headers()
         debug_print(f"📋 Headers prepared (auth token length: {len(headers.get('Cookie', '').split('arena-auth-prod-v1=')[-1].split(';')[0])} chars)")
-        
+
         # Check if conversation exists for this API key
         session = chat_sessions[api_key_str].get(conversation_id)
-        
-        # Detect retry: if session exists and last message is same user message (no assistant response after it)
-        is_retry = False
-        retry_message_id = None
-        
-        if session and len(session.get("messages", [])) >= 2:
-            stored_messages = session["messages"]
-            # Check if last stored message is from user with same content
-            if stored_messages[-1]["role"] == "user" and stored_messages[-1]["content"] == prompt:
-                # This is a retry - client sent same message again without assistant response
-                is_retry = True
-                retry_message_id = stored_messages[-1]["id"]
-                # Get the assistant message ID that needs to be regenerated
-                if len(stored_messages) >= 2 and stored_messages[-2]["role"] == "assistant":
-                    # There was a previous assistant response - we'll retry that one
-                    retry_message_id = stored_messages[-2]["id"]
-                    debug_print(f"🔁 RETRY DETECTED - Regenerating assistant message {retry_message_id}")
-        
-        if is_retry and retry_message_id:
-            debug_print(f"🔁 Using RETRY endpoint")
-            # Use LMArena's retry endpoint
-            # Format: PUT /nextjs-api/stream/retry-evaluation-session-message/{sessionId}/messages/{messageId}
-            # Note: We don't need a payload for retry, just the recaptchaV3Token (optional)
-            payload = {
-                "recaptchaV3Token": ""  # Optional, can be empty
-            }
-            url = f"https://lmarena.ai/nextjs-api/stream/retry-evaluation-session-message/{session['conversation_id']}/messages/{retry_message_id}"
-            debug_print(f"📤 Target URL: {url}")
-            debug_print(f"📦 Using PUT method for retry")
-            http_method = "PUT"
-        elif not session:
+        debug_print(f"🎯 Session exists: {session is not None}")
+
+        if not session:
             debug_print("🆕 Creating NEW conversation session")
             # New conversation - Generate all IDs at once (like the browser does)
             session_id = str(uuid7())
             user_msg_id = str(uuid7())
             model_msg_id = str(uuid7())
-            
+
             debug_print(f"🔑 Generated session_id: {session_id}")
             debug_print(f"👤 Generated user_msg_id: {user_msg_id}")
             debug_print(f"🤖 Generated model_msg_id: {model_msg_id}")
-            
+
             payload = {
                 "id": session_id,
                 "mode": "direct",
@@ -1537,13 +1904,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     "content": prompt,
                     "experimental_attachments": experimental_attachments
                 },
-                "modality": modality
+                "modality": "chat"
             }
             url = "https://lmarena.ai/nextjs-api/stream/create-evaluation"
             debug_print(f"📤 Target URL: {url}")
-            debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
-            http_method = "POST"
         else:
             debug_print("🔄 Using EXISTING conversation session")
             # Follow-up message - Generate new message IDs
@@ -1551,7 +1915,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             debug_print(f"👤 Generated followup user_msg_id: {user_msg_id}")
             model_msg_id = str(uuid7())
             debug_print(f"🤖 Generated followup model_msg_id: {model_msg_id}")
-            
+
             payload = {
                 "id": session["conversation_id"],
                 "mode": "direct",
@@ -1562,30 +1926,88 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     "content": prompt,
                     "experimental_attachments": experimental_attachments
                 },
-                "modality": modality
+                "modality": "chat"
             }
             url = f"https://lmarena.ai/nextjs-api/stream/post-to-evaluation/{session['conversation_id']}"
             debug_print(f"📤 Target URL: {url}")
-            debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
-            http_method = "POST"
+
+        # Final payload validation - ensure content is not empty or whitespace-only
+        payload_content = str(payload["userMessage"]["content"]).strip()
+        payload_attachments = payload["userMessage"]["experimental_attachments"]
+        has_payload_attachments = isinstance(payload_attachments, (list, tuple)) and len(payload_attachments) > 0
+        
+        # If content is empty but we have attachments, use default message
+        if not payload_content and has_payload_attachments:
+            payload["userMessage"]["content"] = "[Image]"
+            debug_print(f"ℹ️  Empty payload content with attachments, using default '[Image]' message")
+        elif not payload_content and not has_payload_attachments:
+            # This should never happen due to earlier validation, but just in case
+            debug_print(f"❌ CRITICAL: Final payload has empty content and no attachments")
+            raise HTTPException(
+                status_code=400,
+                detail="Message content is empty. Please provide text content or ensure images are properly formatted."
+            )
+
+        # Add delay to avoid LMArena rate limiting
+        debug_print("⏳ Adding 2-second delay to avoid LMArena rate limiting...")
+        await asyncio.sleep(2)
 
         debug_print(f"\n🚀 Making API request to LMArena...")
         debug_print(f"⏱️  Timeout set to: 120 seconds")
-        
+        debug_print(f"📤 Final URL: {url}")
+        debug_print(f"📦 Full payload: {json.dumps(payload, indent=2)}")
+        debug_print(f"📏 Payload size: {len(json.dumps(payload))} chars")
+        debug_print(f"📋 Headers: {headers}")
+
+        # Add reCAPTCHA token if available (non-blocking)
+        try:
+            recaptcha_token = get_cached_recaptcha_token()
+            if recaptcha_token:
+                # Add reCAPTCHA token to headers
+                current_cookie = headers.get("Cookie", "")
+                if current_cookie:
+                    headers["Cookie"] = current_cookie + f"; g-recaptcha-response={recaptcha_token}"
+                else:
+                    headers["Cookie"] = f"g-recaptcha-response={recaptcha_token}"
+                debug_print(f"🔐 Added reCAPTCHA token to headers")
+            else:
+                debug_print(f"⚠️ No reCAPTCHA token available")
+        except Exception as e:
+            debug_print(f"⚠️ reCAPTCHA integration failed: {e}")
+            # Continue without reCAPTCHA token
+
         # Handle streaming mode
         if stream:
             async def generate_stream():
                 response_text = ""
-                reasoning_text = ""
-                citations = []
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
-                
-                async with httpx.AsyncClient() as client:
+
+                # Get random proxy if available
+                proxy = None
+                if HTTP_PROXIES:
+                    import random
+                    proxy = random.choice(HTTP_PROXIES)
+                    debug_print(f"🌐 Using proxy: {proxy}")
+                else:
+                    debug_print("🌐 No proxies configured, using direct connection")
+
+                async with httpx.AsyncClient(proxy=proxy) as client:
                     try:
                         debug_print("📡 Sending POST request for streaming...")
+                        debug_print(f"📤 Request URL: {url}")
+                        debug_print(f"📦 Payload userMessage.content: '{payload['userMessage']['content']}'")
+                        debug_print(f"📦 Payload userMessage.experimental_attachments: {len(payload['userMessage']['experimental_attachments'])} items")
                         async with client.stream('POST', url, json=payload, headers=headers, timeout=120) as response:
                             debug_print(f"✅ Stream opened - Status: {response.status_code}")
+                            
+                            if response.is_error:
+                                # Read the response body before raising, so it's available in the exception handler
+                                # even after the stream context closes
+                                try:
+                                    await response.aread()
+                                except Exception as e:
+                                    debug_print(f"⚠️ Failed to read error response body: {e}")
+                            
                             response.raise_for_status()
                             
                             async for line in response.aiter_lines():
@@ -1593,34 +2015,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 if not line:
                                     continue
                                 
-                                # Parse thinking/reasoning chunks: ag:"thinking text"
-                                if line.startswith("ag:"):
-                                    chunk_data = line[3:]
-                                    try:
-                                        reasoning_chunk = json.loads(chunk_data)
-                                        reasoning_text += reasoning_chunk
-                                        
-                                        # Send SSE-formatted chunk with reasoning_content
-                                        chunk_response = {
-                                            "id": chunk_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": model_public_name,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {
-                                                    "reasoning_content": reasoning_chunk
-                                                },
-                                                "finish_reason": None
-                                            }]
-                                        }
-                                        yield f"data: {json.dumps(chunk_response)}\n\n"
-                                        
-                                    except json.JSONDecodeError:
-                                        continue
-                                
                                 # Parse text chunks: a0:"Hello "
-                                elif line.startswith("a0:"):
+                                if line.startswith("a0:"):
                                     chunk_data = line[3:]
                                     try:
                                         text_chunk = json.loads(chunk_data)
@@ -1644,42 +2040,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         
                                     except json.JSONDecodeError:
                                         continue
-                                
-                                # Parse image generation: a2:[{...}] (for image models)
-                                elif line.startswith("a2:"):
-                                    image_data = line[3:]
-                                    try:
-                                        image_list = json.loads(image_data)
-                                        # OpenAI format: return URL in content
-                                        if isinstance(image_list, list) and len(image_list) > 0:
-                                            image_obj = image_list[0]
-                                            if image_obj.get('type') == 'image':
-                                                image_url = image_obj.get('image', '')
-                                                # Store image URL as response text for now
-                                                # Will format properly in final response
-                                                response_text = image_url
-                                                debug_print(f"  🖼️  Image URL received: {image_url[:100]}...")
-                                    except json.JSONDecodeError:
-                                        pass
-                                
-                                # Parse citations/tool calls: ac:{...} (for search models)
-                                elif line.startswith("ac:"):
-                                    citation_data = line[3:]
-                                    try:
-                                        citation_obj = json.loads(citation_data)
-                                        # Extract source information from argsTextDelta
-                                        if 'argsTextDelta' in citation_obj:
-                                            args_data = json.loads(citation_obj['argsTextDelta'])
-                                            if 'source' in args_data:
-                                                source = args_data['source']
-                                                # Can be a single source or array of sources
-                                                if isinstance(source, list):
-                                                    citations.extend(source)
-                                                elif isinstance(source, dict):
-                                                    citations.append(source)
-                                        debug_print(f"  🔗 Citation added: {citation_obj.get('toolCallId')}")
-                                    except json.JSONDecodeError:
-                                        pass
                                 
                                 # Parse error messages
                                 elif line.startswith("a3:"):
@@ -1713,42 +2073,35 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     except json.JSONDecodeError:
                                         continue
                             
-                            # Update session - Store message history with IDs (including reasoning and citations if present)
-                            assistant_message = {
-                                "id": model_msg_id, 
-                                "role": "assistant", 
-                                "content": response_text.strip()
-                            }
-                            if reasoning_text:
-                                assistant_message["reasoning_content"] = reasoning_text.strip()
-                            if citations:
-                                # Deduplicate citations by URL
-                                unique_citations = []
-                                seen_urls = set()
-                                for citation in citations:
-                                    citation_url = citation.get('url')
-                                    if citation_url and citation_url not in seen_urls:
-                                        seen_urls.add(citation_url)
-                                        unique_citations.append(citation)
-                                assistant_message["citations"] = unique_citations
-                            
+                            # Update session - Store message history with IDs
                             if not session:
+                                # New conversation - store all messages from the request
+                                stored_messages = []
+                                for msg in messages:
+                                    stored_messages.append({
+                                        "id": user_msg_id if msg.get("role") == "user" else str(uuid7()),
+                                        "role": msg.get("role"),
+                                        "content": msg.get("content")
+                                    })
+                                stored_messages.append({
+                                    "id": model_msg_id,
+                                    "role": "assistant",
+                                    "content": response_text.strip()
+                                })
+
                                 chat_sessions[api_key_str][conversation_id] = {
                                     "conversation_id": session_id,
                                     "model": model_public_name,
-                                    "messages": [
-                                        {"id": user_msg_id, "role": "user", "content": prompt},
-                                        assistant_message
-                                    ]
+                                    "messages": stored_messages
                                 }
                                 debug_print(f"💾 Saved new session for conversation {conversation_id}")
                             else:
-                                # Append new messages to history
+                                # Existing conversation - append the new exchange
                                 chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    {"id": user_msg_id, "role": "user", "content": prompt}
+                                    {"id": user_msg_id, "role": "user", "content": last_user_message_content}
                                 )
                                 chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    assistant_message
+                                    {"id": model_msg_id, "role": "assistant", "content": response_text.strip()}
                                 )
                                 debug_print(f"💾 Updated existing session for conversation {conversation_id}")
                             
@@ -1756,22 +2109,23 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
                             
                     except httpx.HTTPStatusError as e:
-                        # Provide user-friendly error messages
-                        if e.response.status_code == 429:
-                            error_msg = "Rate limit exceeded on LMArena. Please try again in a few moments."
-                            error_type = "rate_limit_error"
-                        elif e.response.status_code == 401:
-                            error_msg = "Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard."
-                            error_type = "authentication_error"
-                        else:
-                            error_msg = f"LMArena API error: {e.response.status_code}"
-                            error_type = "api_error"
+                        error_msg = f"LMArena API error: {e.response.status_code}"
+                        try:
+                            # Response should already be read inside the stream context
+                            try:
+                                error_body = e.response.json()
+                                error_msg += f" - {error_body}"
+                            except:
+                                error_msg += f" - {e.response.text[:500]}"
+                        except Exception as read_err:
+                            error_msg += f" - (Could not read response: {read_err})"
                         
                         print(f"❌ {error_msg}")
+                        print(f"📤 Request payload: {json.dumps(payload, indent=2)[:500]}")
                         error_chunk = {
                             "error": {
                                 "message": error_msg,
-                                "type": error_type,
+                                "type": "api_error",
                                 "code": e.response.status_code
                             }
                         }
@@ -1788,14 +2142,24 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
         
-        # Handle non-streaming mode
-        async with httpx.AsyncClient() as client:
+        # Handle non-streaming mode (original code)
+        # Get random proxy if available
+        proxy = None
+        if HTTP_PROXIES:
+            import random
+            proxy = random.choice(HTTP_PROXIES)
+            debug_print(f"🌐 Using proxy: {proxy}")
+        else:
+            debug_print("🌐 No proxies configured, using direct connection")
+
+        client_proxies = {"http": proxy, "https": proxy} if proxy else None
+        async with httpx.AsyncClient(proxies=client_proxies) as client:
             try:
-                debug_print(f"📡 Sending {http_method} request...")
-                if http_method == "PUT":
-                    response = await client.put(url, json=payload, headers=headers, timeout=120)
-                else:
-                    response = await client.post(url, json=payload, headers=headers, timeout=120)
+                debug_print("📡 Sending POST request...")
+                debug_print(f"📤 Request URL: {url}")
+                debug_print(f"📦 Payload userMessage.content: '{payload['userMessage']['content']}'")
+                debug_print(f"📦 Payload userMessage.experimental_attachments: {len(payload['userMessage']['experimental_attachments'])} items")
+                response = await client.post(url, json=payload, headers=headers, timeout=120)
                 
                 debug_print(f"✅ Response received - Status: {response.status_code}")
                 debug_print(f"📏 Response length: {len(response.text)} characters")
@@ -1804,18 +2168,17 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 response.raise_for_status()
                 
                 debug_print(f"🔍 Processing response...")
+                debug_print(f"📄 Response status: {response.status_code}")
                 debug_print(f"📄 First 500 chars of response:\n{response.text[:500]}")
+                if response.status_code != 200:
+                    debug_print(f"❌ Full error response: {response.text}")
                 
                 # Process response in lmarena format
-                # Format: ag:"thinking" for reasoning, a0:"text chunk" for content, ac:{...} for citations, ad:{...} for metadata
+                # Format: a0:"text chunk" for content, ad:{...} for metadata
                 response_text = ""
-                reasoning_text = ""
-                citations = []
                 finish_reason = None
                 line_count = 0
                 text_chunks_found = 0
-                reasoning_chunks_found = 0
-                citation_chunks_found = 0
                 metadata_found = 0
                 
                 debug_print(f"📊 Parsing response lines...")
@@ -1827,22 +2190,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     if not line:
                         continue
                     
-                    # Parse thinking/reasoning chunks: ag:"thinking text"
-                    if line.startswith("ag:"):
-                        chunk_data = line[3:]  # Remove "ag:" prefix
-                        reasoning_chunks_found += 1
-                        try:
-                            # Parse as JSON string (includes quotes)
-                            reasoning_chunk = json.loads(chunk_data)
-                            reasoning_text += reasoning_chunk
-                            if reasoning_chunks_found <= 3:  # Log first 3 reasoning chunks
-                                debug_print(f"  🧠 Reasoning chunk {reasoning_chunks_found}: {repr(reasoning_chunk[:50])}")
-                        except json.JSONDecodeError as e:
-                            debug_print(f"  ⚠️ Failed to parse reasoning chunk on line {line_count}: {chunk_data[:100]} - {e}")
-                            continue
-                    
                     # Parse text chunks: a0:"Hello "
-                    elif line.startswith("a0:"):
+                    if line.startswith("a0:"):
                         chunk_data = line[3:]  # Remove "a0:" prefix
                         text_chunks_found += 1
                         try:
@@ -1853,45 +2202,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 debug_print(f"  ✅ Chunk {text_chunks_found}: {repr(text_chunk[:50])}")
                         except json.JSONDecodeError as e:
                             debug_print(f"  ⚠️ Failed to parse text chunk on line {line_count}: {chunk_data[:100]} - {e}")
-                            continue
-                    
-                    # Parse image generation: a2:[{...}] (for image models)
-                    elif line.startswith("a2:"):
-                        image_data = line[3:]  # Remove "a2:" prefix
-                        try:
-                            image_list = json.loads(image_data)
-                            # OpenAI format expects URL in content
-                            if isinstance(image_list, list) and len(image_list) > 0:
-                                image_obj = image_list[0]
-                                if image_obj.get('type') == 'image':
-                                    image_url = image_obj.get('image', '')
-                                    # For image models, the URL IS the response
-                                    response_text = image_url
-                                    debug_print(f"  🖼️  Image URL: {image_url[:100]}...")
-                        except json.JSONDecodeError as e:
-                            debug_print(f"  ⚠️ Failed to parse image data on line {line_count}: {image_data[:100]} - {e}")
-                            continue
-                    
-                    # Parse citations/tool calls: ac:{...} (for search models)
-                    elif line.startswith("ac:"):
-                        citation_data = line[3:]  # Remove "ac:" prefix
-                        citation_chunks_found += 1
-                        try:
-                            citation_obj = json.loads(citation_data)
-                            # Extract source information from argsTextDelta
-                            if 'argsTextDelta' in citation_obj:
-                                args_data = json.loads(citation_obj['argsTextDelta'])
-                                if 'source' in args_data:
-                                    source = args_data['source']
-                                    # Can be a single source or array of sources
-                                    if isinstance(source, list):
-                                        citations.extend(source)
-                                    elif isinstance(source, dict):
-                                        citations.append(source)
-                            if citation_chunks_found <= 3:  # Log first 3 citations
-                                debug_print(f"  🔗 Citation chunk {citation_chunks_found}: {citation_obj.get('toolCallId')}")
-                        except json.JSONDecodeError as e:
-                            debug_print(f"  ⚠️ Failed to parse citation chunk on line {line_count}: {citation_data[:100]} - {e}")
                             continue
                     
                     # Parse error messages: a3:"An error occurred"
@@ -1921,13 +2231,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
 
                 debug_print(f"\n📊 Parsing Summary:")
                 debug_print(f"  - Total lines: {line_count}")
-                debug_print(f"  - Reasoning chunks found: {reasoning_chunks_found}")
                 debug_print(f"  - Text chunks found: {text_chunks_found}")
-                debug_print(f"  - Citation chunks found: {citation_chunks_found}")
                 debug_print(f"  - Metadata entries: {metadata_found}")
                 debug_print(f"  - Final response length: {len(response_text)} chars")
-                debug_print(f"  - Final reasoning length: {len(reasoning_text)} chars")
-                debug_print(f"  - Citations found: {len(citations)}")
                 debug_print(f"  - Finish reason: {finish_reason}")
                 
                 if not response_text:
@@ -1958,78 +2264,27 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 else:
                     debug_print(f"✅ Response text preview: {response_text[:200]}...")
                 
-                # Update session - Store message history with IDs (including reasoning and citations if present)
-                assistant_message = {
-                    "id": model_msg_id, 
-                    "role": "assistant", 
-                    "content": response_text.strip()
-                }
-                if reasoning_text:
-                    assistant_message["reasoning_content"] = reasoning_text.strip()
-                if citations:
-                    # Deduplicate citations by URL
-                    unique_citations = []
-                    seen_urls = set()
-                    for citation in citations:
-                        citation_url = citation.get('url')
-                        if citation_url and citation_url not in seen_urls:
-                            seen_urls.add(citation_url)
-                            unique_citations.append(citation)
-                    assistant_message["citations"] = unique_citations
-                
+                # Update session - Store message history with IDs
                 if not session:
                     chat_sessions[api_key_str][conversation_id] = {
                         "conversation_id": session_id,
                         "model": model_public_name,
                         "messages": [
-                            {"id": user_msg_id, "role": "user", "content": prompt},
-                            assistant_message
+                            {"id": user_msg_id, "role": "user", "content": last_user_message_content or prompt},
+                            {"id": model_msg_id, "role": "assistant", "content": response_text.strip()}
                         ]
                     }
                     debug_print(f"💾 Saved new session for conversation {conversation_id}")
                 else:
                     # Append new messages to history
                     chat_sessions[api_key_str][conversation_id]["messages"].append(
-                        {"id": user_msg_id, "role": "user", "content": prompt}
+                        {"id": user_msg_id, "role": "user", "content": last_user_message_content or prompt}
                     )
                     chat_sessions[api_key_str][conversation_id]["messages"].append(
-                        assistant_message
+                        {"id": model_msg_id, "role": "assistant", "content": response_text.strip()}
                     )
                     debug_print(f"💾 Updated existing session for conversation {conversation_id}")
 
-                # Build message object with reasoning and citations if present
-                message_obj = {
-                    "role": "assistant",
-                    "content": response_text.strip(),
-                }
-                if reasoning_text:
-                    message_obj["reasoning_content"] = reasoning_text.strip()
-                if citations:
-                    # Deduplicate citations by URL
-                    unique_citations = []
-                    seen_urls = set()
-                    for citation in citations:
-                        citation_url = citation.get('url')
-                        if citation_url and citation_url not in seen_urls:
-                            seen_urls.add(citation_url)
-                            unique_citations.append(citation)
-                    message_obj["citations"] = unique_citations
-                
-                # Calculate token counts (including reasoning tokens)
-                prompt_tokens = len(prompt)
-                completion_tokens = len(response_text)
-                reasoning_tokens = len(reasoning_text)
-                total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
-                
-                # Build usage object with reasoning tokens if present
-                usage_obj = {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens
-                }
-                if reasoning_tokens > 0:
-                    usage_obj["reasoning_tokens"] = reasoning_tokens
-                
                 final_response = {
                     "id": f"chatcmpl-{uuid.uuid4()}",
                     "object": "chat.completion",
@@ -2038,10 +2293,17 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     "conversation_id": conversation_id,
                     "choices": [{
                         "index": 0,
-                        "message": message_obj,
+                        "message": {
+                            "role": "assistant",
+                            "content": response_text.strip(),
+                        },
                         "finish_reason": "stop"
                     }],
-                    "usage": usage_obj
+                    "usage": {
+                        "prompt_tokens": len(prompt),
+                        "completion_tokens": len(response_text),
+                        "total_tokens": len(prompt) + len(response_text)
+                    }
                 }
                 
                 debug_print(f"\n✅ REQUEST COMPLETED SUCCESSFULLY")
@@ -2050,22 +2312,12 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 return final_response
 
             except httpx.HTTPStatusError as e:
-                # Provide user-friendly error messages
-                if e.response.status_code == 429:
-                    error_detail = "Rate limit exceeded on LMArena. Please try again in a few moments."
-                    error_type = "rate_limit_error"
-                elif e.response.status_code == 401:
-                    error_detail = "Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard."
-                    error_type = "authentication_error"
-                else:
-                    error_detail = f"LMArena API error: {e.response.status_code}"
-                    try:
-                        error_body = e.response.json()
-                        error_detail += f" - {error_body}"
-                    except:
-                        error_detail += f" - {e.response.text[:200]}"
-                    error_type = "upstream_error"
-                
+                error_detail = f"LMArena API error: {e.response.status_code}"
+                try:
+                    error_body = e.response.json()
+                    error_detail += f" - {error_body}"
+                except:
+                    error_detail += f" - {e.response.text[:200]}"
                 print(f"\n❌ HTTP STATUS ERROR")
                 print(f"📛 Error detail: {error_detail}")
                 print(f"📤 Request URL: {url}")
@@ -2074,6 +2326,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 print("="*80 + "\n")
                 
                 # Return OpenAI-compatible error response
+                error_type = "rate_limit_error" if e.response.status_code == 429 else "upstream_error"
                 return {
                     "error": {
                         "message": error_detail,

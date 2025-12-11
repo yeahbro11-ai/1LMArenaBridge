@@ -58,7 +58,6 @@ class RecaptchaBypass:
         """
         self.cache_ttl = cache_ttl
         self._token_cache: Dict[str, tuple[str, float]] = {}
-        self._browser = None
         
     def _is_cache_valid(self, key: str) -> bool:
         """Check if cached token is still valid"""
@@ -148,24 +147,6 @@ class RecaptchaBypass:
             debug_print(f"❌ Error validating anchor URL: {e}")
             return False
     
-    async def _get_browser(self) -> AsyncCamoufox:
-        """Get or create AsyncCamoufox browser instance"""
-        if self._browser is None or not self._browser.is_connected():
-            debug_print("🆕 Creating new AsyncCamoufox browser instance...")
-            self._browser = AsyncCamoufox(headless=True)
-        return self._browser
-    
-    async def _close_browser(self):
-        """Close browser instance if open"""
-        if self._browser and self._browser.is_connected():
-            try:
-                await self._browser.close()
-                debug_print("🔒 Closed AsyncCamoufox browser instance")
-            except Exception as e:
-                debug_print(f"⚠️  Error closing browser: {e}")
-            finally:
-                self._browser = None
-    
     async def _extract_token_from_browser(self, anchor_url: str) -> Optional[str]:
         """
         Extract X-RECAPTCHA-TOKEN using browser automation.
@@ -179,156 +160,159 @@ class RecaptchaBypass:
         Returns:
             X-RECAPTCHA-TOKEN if successful, None otherwise
         """
-        browser = None
+        page = None
         try:
             debug_print(f"🌐 Starting browser-based token extraction...")
             debug_print(f"📍 Target URL: {anchor_url[:100]}...")
             
-            # Get browser instance
-            browser = await self._get_browser()
-            
-            # Create new page
-            page = await browser.new_page()
-            
-            # Set up response interceptor to capture token responses
-            token_response = None
-            
-            async def capture_token_response(response):
-                nonlocal token_response
-                try:
-                    url = response.url
-                    if 'recaptcha/enterprise' in url and response.status == 200:
-                        # Look for token in response text
-                        text = await response.text()
-                        
-                        # Try to find token in various patterns
-                        patterns = [
-                            r'"response":"([A-Za-z0-9_-]{100,})"',
-                            r'"recaptcha_token":"([A-Za-z0-9_-]{100,})"',
-                            r'token["\']\s*:\s*["\']([A-Za-z0-9_-]{100,})["\']',
-                            r'"token":\s*"([A-Za-z0-9_-]{100,})"',
-                            r'([A-Za-z0-9_-]{100,})'
-                        ]
-                        
-                        for pattern in patterns:
-                            match = re.search(pattern, text)
-                            if match:
-                                potential_token = match.group(1)
-                                if len(potential_token) > 50:  # Likely a real token
-                                    token_response = potential_token
-                                    debug_print(f"🎯 Token captured from response: {potential_token[:20]}...")
-                                    break
-                        
-                except Exception as e:
-                    debug_print(f"⚠️  Error capturing response: {e}")
-            
-            # Register response interceptor
-            page.on('response', capture_token_response)
-            
-            # Set viewport and user agent
-            await page.set_viewport_size({"width": 1920, "height": 1080})
-            await page.set_extra_http_headers({
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            })
-            
-            # Navigate to anchor URL
-            debug_print("📤 Navigating to anchor URL...")
-            await page.goto(anchor_url, wait_until="networkidle", timeout=30000)
-            
-            # Wait for captcha challenge to potentially complete
-            debug_print("⏳ Waiting for captcha challenge...")
-            await asyncio.sleep(5)
-            
-            # Try to find captcha iframe and trigger if needed
-            try:
-                # Look for invisible reCAPTCHA iframe
-                iframe = await page.wait_for_selector('iframe[src*="recaptcha/enterprise"]', timeout=10000)
-                if iframe:
-                    debug_print("✅ Found reCAPTCHA iframe")
-                    # Click on iframe to trigger challenge
-                    await iframe.click()
-                    await asyncio.sleep(3)
-            except Exception as e:
-                debug_print(f"⚠️  No iframe found or click failed: {e}")
-            
-            # Additional wait for challenge completion
-            debug_print("⏳ Waiting for challenge completion...")
-            await asyncio.sleep(5)
-            
-            # Try multiple extraction methods
-            extraction_methods = [
-                self._extract_from_page_content,
-                self._extract_from_network_tab,
-                self._extract_from_browser_storage
-            ]
-            
-            for method in extraction_methods:
-                try:
-                    token = await method(page)
-                    if token:
-                        debug_print(f"🎉 Token extracted successfully using {method.__name__}")
-                        return token
-                except Exception as e:
-                    debug_print(f"⚠️  {method.__name__} failed: {e}")
-                    continue
-            
-            # If still no token, try to execute JavaScript to get it
-            try:
-                js_token = await page.evaluate("""
-                    () => {
-                        // Try to find token in various ways
-                        const methods = [
-                            () => window.___grecaptcha_cfg?.callback,
-                            () => window.grecaptcha?.enterprise?.render?.token,
-                            () => document.querySelector('textarea[name="g-recaptcha-response"]')?.value,
-                            () => window.grecaptcha?.enterprise?.getResponse?.(),
-                            () => {
-                                // Look for token in script tags
-                                const scripts = document.querySelectorAll('script');
-                                for (let script of scripts) {
-                                    if (script.textContent) {
-                                        const match = script.textContent.match(/"response":"([A-Za-z0-9_-]{100,})"/);
-                                        if (match) return match[1];
-                                    }
-                                }
-                                return null;
-                            }
-                        ];
-                        
-                        for (let method of methods) {
-                            try {
-                                const result = method();
-                                if (result && typeof result === 'string' && result.length > 50) {
-                                    return result;
-                                }
-                            } catch (e) {
-                                // Continue to next method
-                            }
-                        }
-                        return null;
-                    }
-                """)
+            # Use AsyncCamoufox as context manager to get browser instance
+            async with AsyncCamoufox(headless=True) as browser:
+                debug_print("✅ AsyncCamoufox browser instance created")
                 
-                if js_token:
-                    debug_print(f"🎯 Token extracted via JavaScript: {js_token[:20]}...")
-                    return js_token
+                # Create new page
+                page = await browser.new_page()
+                
+                # Set up response interceptor to capture token responses
+                token_response = None
+                
+                async def capture_token_response(response):
+                    nonlocal token_response
+                    try:
+                        url = response.url
+                        if 'recaptcha/enterprise' in url and response.status == 200:
+                            # Look for token in response text
+                            text = await response.text()
+                            
+                            # Try to find token in various patterns
+                            patterns = [
+                                r'"response":"([A-Za-z0-9_-]{100,})"',
+                                r'"recaptcha_token":"([A-Za-z0-9_-]{100,})"',
+                                r'token["\']\s*:\s*["\']([A-Za-z0-9_-]{100,})["\']',
+                                r'"token":\s*"([A-Za-z0-9_-]{100,})"',
+                                r'([A-Za-z0-9_-]{100,})'
+                            ]
+                            
+                            for pattern in patterns:
+                                match = re.search(pattern, text)
+                                if match:
+                                    potential_token = match.group(1)
+                                    if len(potential_token) > 50:  # Likely a real token
+                                        token_response = potential_token
+                                        debug_print(f"🎯 Token captured from response: {potential_token[:20]}...")
+                                        break
+                            
+                    except Exception as e:
+                        debug_print(f"⚠️  Error capturing response: {e}")
+                
+                # Register response interceptor
+                page.on('response', capture_token_response)
+                
+                # Set viewport and user agent
+                await page.set_viewport_size({"width": 1920, "height": 1080})
+                await page.set_extra_http_headers({
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                })
+                
+                # Navigate to anchor URL
+                debug_print("📤 Navigating to anchor URL...")
+                await page.goto(anchor_url, wait_until="networkidle", timeout=30000)
+                
+                # Wait for captcha challenge to potentially complete
+                debug_print("⏳ Waiting for captcha challenge...")
+                await asyncio.sleep(5)
+                
+                # Try to find captcha iframe and trigger if needed
+                try:
+                    # Look for invisible reCAPTCHA iframe
+                    iframe = await page.wait_for_selector('iframe[src*="recaptcha/enterprise"]', timeout=10000)
+                    if iframe:
+                        debug_print("✅ Found reCAPTCHA iframe")
+                        # Click on iframe to trigger challenge
+                        await iframe.click()
+                        await asyncio.sleep(3)
+                except Exception as e:
+                    debug_print(f"⚠️  No iframe found or click failed: {e}")
+                
+                # Additional wait for challenge completion
+                debug_print("⏳ Waiting for challenge completion...")
+                await asyncio.sleep(5)
+                
+                # Try multiple extraction methods
+                extraction_methods = [
+                    self._extract_from_page_content,
+                    self._extract_from_network_tab,
+                    self._extract_from_browser_storage
+                ]
+                
+                for method in extraction_methods:
+                    try:
+                        token = await method(page)
+                        if token:
+                            debug_print(f"🎉 Token extracted successfully using {method.__name__}")
+                            await page.close()
+                            return token
+                    except Exception as e:
+                        debug_print(f"⚠️  {method.__name__} failed: {e}")
+                        continue
+                
+                # If still no token, try to execute JavaScript to get it
+                try:
+                    js_token = await page.evaluate("""
+                        () => {
+                            // Try to find token in various ways
+                            const methods = [
+                                () => window.___grecaptcha_cfg?.callback,
+                                () => window.grecaptcha?.enterprise?.render?.token,
+                                () => document.querySelector('textarea[name="g-recaptcha-response"]')?.value,
+                                () => window.grecaptcha?.enterprise?.getResponse?.(),
+                                () => {
+                                    // Look for token in script tags
+                                    const scripts = document.querySelectorAll('script');
+                                    for (let script of scripts) {
+                                        if (script.textContent) {
+                                            const match = script.textContent.match(/"response":"([A-Za-z0-9_-]{100,})"/);
+                                            if (match) return match[1];
+                                        }
+                                    }
+                                    return null;
+                                }
+                            ];
+                            
+                            for (let method of methods) {
+                                try {
+                                    const result = method();
+                                    if (result && typeof result === 'string' && result.length > 50) {
+                                        return result;
+                                    }
+                                } catch (e) {
+                                    // Continue to next method
+                                }
+                            }
+                            return null;
+                        }
+                    """)
                     
-            except Exception as e:
-                debug_print(f"⚠️  JavaScript extraction failed: {e}")
-            
-            debug_print("❌ All token extraction methods failed")
-            return None
+                    if js_token:
+                        debug_print(f"🎯 Token extracted via JavaScript: {js_token[:20]}...")
+                        await page.close()
+                        return js_token
+                        
+                except Exception as e:
+                    debug_print(f"⚠️  JavaScript extraction failed: {e}")
+                
+                # Close page before exiting context
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                
+                debug_print("❌ All token extraction methods failed")
+                return None
             
         except Exception as e:
             debug_print(f"❌ Browser extraction failed: {e}")
             return None
-            
-        finally:
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
     
     async def _extract_from_page_content(self, page) -> Optional[str]:
         """Extract token from page content"""
@@ -536,7 +520,6 @@ class RecaptchaBypass:
     
     async def cleanup(self):
         """Cleanup resources"""
-        await self._close_browser()
         self._token_cache.clear()
         debug_print("🧹 RecaptchaBypass cleanup completed")
 

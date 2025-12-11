@@ -1,4 +1,27 @@
 venv/
+.venv/
 *webui_secret_key
 *cache_ggshield
 config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Camoufox cache
+.cache/

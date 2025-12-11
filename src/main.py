@@ -576,14 +576,37 @@ def get_request_headers():
     
     return get_request_headers_with_token(token)
 
-def get_request_headers_with_token(token: str):
-    """Get request headers with a specific auth token"""
+def get_request_headers_with_token(token: str, include_captcha_token: bool = False, for_streaming: bool = False):
+    """Get request headers with a specific auth token
+    
+    Args:
+        token: The auth token to use
+        include_captcha_token: Whether to include a reCAPTCHA token in headers (for streaming)
+        for_streaming: Whether headers are for streaming requests (adds streaming-specific headers)
+    """
     config = get_config()
     cf_clearance = config.get("cf_clearance", "").strip()
-    return {
+    
+    # Base headers
+    headers = {
         "Content-Type": "text/plain;charset=UTF-8",
         "Cookie": f"cf_clearance={cf_clearance}; arena-auth-prod-v1={token}",
     }
+    
+    # Add User-Agent header (important for Cloudflare/browser compatibility)
+    headers["User-Agent"] = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    
+    # Add Accept header (important for proper content negotiation)
+    if for_streaming:
+        headers["Accept"] = "text/event-stream"
+    else:
+        headers["Accept"] = "*/*"
+    
+    # Include reCAPTCHA token if requested and available
+    if include_captcha_token and captcha_token_cache.get("token"):
+        headers["x-recaptcha-token"] = captcha_token_cache["token"]
+    
+    return headers
 
 def get_next_auth_token(exclude_tokens: set = None):
     """Get next auth token using round-robin selection
@@ -2242,9 +2265,19 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         request_id = str(uuid.uuid4())
         failed_tokens = set()
         
+        # Get a fresh reCAPTCHA token before making any requests
+        debug_print("🔐 Getting reCAPTCHA token for request...")
+        captcha_token = await get_captcha_token()
+        if captcha_token:
+            debug_print(f"✅ Got reCAPTCHA token (expires in ~120s)")
+        else:
+            debug_print(f"⚠️  Could not get reCAPTCHA token, continuing without it")
+        
         # Get initial auth token using round-robin (excluding any failed ones)
         current_token = get_next_auth_token(exclude_tokens=failed_tokens)
         headers = get_request_headers_with_token(current_token)
+        if captcha_token:
+            headers["x-recaptcha-token"] = captcha_token
         debug_print(f"🔑 Using token (round-robin): {current_token[:20]}...")
         
         # Retry logic wrapper
@@ -2323,6 +2356,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 nonlocal current_token, headers
                 chunk_id = f"chatcmpl-{uuid.uuid4()}"
                 
+                # Get a fresh reCAPTCHA token before streaming starts
+                debug_print("🔐 Getting reCAPTCHA token for streaming...")
+                captcha_token = await get_captcha_token()
+                if captcha_token:
+                    debug_print(f"✅ Got reCAPTCHA token for streaming (expires in ~120s)")
+                else:
+                    debug_print(f"⚠️  Could not get reCAPTCHA token, streaming may fail with 403")
+                
                 # Retry logic for streaming
                 max_retries = 3
                 for attempt in range(max_retries):
@@ -2334,10 +2375,16 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         async with httpx.AsyncClient() as client:
                             debug_print(f"📡 Sending {http_method} request for streaming (attempt {attempt + 1}/{max_retries})...")
                             
+                            # Prepare headers with reCAPTCHA token for streaming
+                            # Use streaming-specific headers for better compatibility
+                            stream_headers = get_request_headers_with_token(current_token, for_streaming=True)
+                            if captcha_token:
+                                stream_headers["x-recaptcha-token"] = captcha_token
+                            
                             if http_method == "PUT":
-                                stream_context = client.stream('PUT', url, json=payload, headers=headers, timeout=120)
+                                stream_context = client.stream('PUT', url, json=payload, headers=stream_headers, timeout=120)
                             else:
-                                stream_context = client.stream('POST', url, json=payload, headers=headers, timeout=120)
+                                stream_context = client.stream('POST', url, json=payload, headers=stream_headers, timeout=120)
                             
                             async with stream_context as response:
                                 # Log status with human-readable message
@@ -2348,7 +2395,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     debug_print(f"⏱️  Stream attempt {attempt + 1}/{max_retries}")
                                     if attempt < max_retries - 1:
                                         current_token = get_next_auth_token()
-                                        headers = get_request_headers_with_token(current_token)
+                                        # Also refresh reCAPTCHA token on rate limit retry
+                                        captcha_token = await get_captcha_token()
                                         debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
                                         await asyncio.sleep(1)
                                         continue
@@ -2359,13 +2407,30 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     if attempt < max_retries - 1:
                                         try:
                                             current_token = get_next_auth_token()
-                                            headers = get_request_headers_with_token(current_token)
+                                            # Also refresh reCAPTCHA token on auth error retry
+                                            captcha_token = await get_captcha_token()
                                             debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
                                             await asyncio.sleep(1)
                                             continue
                                         except HTTPException:
                                             debug_print(f"❌ No more tokens available")
                                             break
+                                
+                                elif response.status_code == HTTPStatus.FORBIDDEN:
+                                    debug_print(f"🚫 Stream returned 403 Forbidden - trying with different headers/token")
+                                    if attempt < max_retries - 1:
+                                        try:
+                                            # Try with a different auth token
+                                            current_token = get_next_auth_token()
+                                            # Also refresh reCAPTCHA token
+                                            captcha_token = await get_captcha_token()
+                                            debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
+                                            await asyncio.sleep(1)
+                                            continue
+                                        except HTTPException:
+                                            debug_print(f"❌ No more tokens available for retry")
+                                        except Exception as e:
+                                            debug_print(f"❌ Error during 403 retry: {e}")
                                 
                                 log_http_status(response.status_code, "Stream Connection")
                                 response.raise_for_status()
